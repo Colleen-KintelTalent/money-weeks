@@ -4,9 +4,9 @@ A weekly savings, spending and investment tracker for one person. Single page, n
 backend, no accounts, no build step, no dependencies. State lives in `localStorage`
 on the user's own device.
 
-The user is on a Samsung, is paid every Wednesday, and holds several investments
-(index funds, crypto) that he moves money between often. He is not technical. The
-target is a savings goal by a fixed date.
+Built for one person on an Android phone, paid on a fixed weekday, holding several
+investments that they move money between often. The target is a savings goal by a
+fixed date.
 
 **Read the model section before changing anything.** The design went through one
 full rewrite because the first version tracked the wrong thing, and the rules below
@@ -14,14 +14,14 @@ are what came out of that.
 
 ## The model: two streams
 
-Money arrives, and he immediately splits it. That split is the whole app.
+Money arrives and is split straight away. That split is the whole app.
 
-**Stream one, the goal.** Savings plus what his investments are worth today. This is
+**Stream one, the goal.** Savings plus what the investments are worth today. This is
 what the headline number and the deadline maths are about.
 
-**Stream two, spending money.** A single rolling balance. Whatever's left after he
-sets money aside, minus what he spends and what bills take. It rolls over week to
-week — no reset, no weekly envelope. If he underspends, he's just got more next week.
+**Stream two, spending money.** A single rolling balance. Whatever's left after
+money is set aside, minus spending and what bills take. It rolls over week to week
+— no reset, no weekly envelope. Underspending just means more the next week.
 
 The two never mix by accident. Logging an expense can never change the goal. Setting
 money aside can never look like spending. Every figure on screen is derived from
@@ -88,14 +88,14 @@ Google Fonts import, which degrades to a system font offline. `probeStorage()` r
 at boot and shows a banner if storage is blocked rather than losing data quietly.
 Backup and restore are JSON file download and upload.
 
-**6. `safe`, not `wallet`, is what he's shown.** Bills falling due before the next
-payday are already subtracted, so "left to spend" is money that's genuinely his.
+**6. `safe`, not `wallet`, is what's shown.** Bills falling due before the next
+payday are already subtracted, so "left to spend" is money that's genuinely available.
 
 ## Data shape
 
 ```js
 {
-  goal: 90000,
+  goal: 40000,
   deadline: "2026-12-25",
   payDay: 3,                                   // 0=Sun … 3=Wed
   lastBackup: "2026-09-07",                    // drives the 30-day nudge
@@ -164,9 +164,17 @@ No test harness. These are the cases that have actually broken:
 8. Sum check: savings + investments + spending money = paid in + growth − spent.
 9. Backup, wipe, restore → everything returns.
 10. Airplane mode from the home screen → still opens.
+11. **Dates must not shift by a day.** Every date helper formats from local
+    calendar components via `isoLocal()`. Building one with
+    `new Date(...).toISOString().slice(0,10)` parses at local midnight and then
+    converts to UTC, which rolls back a day in any UTC-positive timezone. That
+    bug moved the pay-week boundary, dated morning entries to the day before,
+    and made `advance()` lose a day per occurrence, so recurring bills drifted
+    backwards through the calendar. Check `addMonths("2026-01-31", 1)` is
+    `2026-02-28` and not the 27th.
 
 ## Worth building next
 
-- Import from CSV, to bring in his old spreadsheet history.
+- Import from CSV, to bring in existing spreadsheet history.
 - Per-category weekly budget targets, shown against actuals.
 - A "what if" line: the weekly rate needed if the deadline moves.
