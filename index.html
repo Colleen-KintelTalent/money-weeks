@@ -49,8 +49,8 @@ body{margin:0;font-family:'Barlow',-apple-system,'Segoe UI',Roboto,sans-serif;ba
 .sweep:active{background:rgba(255,255,255,.85)}
 
 .tabs{display:flex;gap:4px;margin-top:12px;background:#d3dade;padding:4px;border-radius:5px}
-.tab{flex:1;padding:10px 2px;font-size:14px;font-weight:500;border:0;border-radius:3px;background:transparent;
-  color:var(--ink-2);cursor:pointer;font-family:inherit}
+.tab{flex:1;padding:10px 1px;font-size:13px;font-weight:500;border:0;border-radius:3px;background:transparent;
+  color:var(--ink-2);cursor:pointer;font-family:inherit;white-space:nowrap}
 .tab[aria-selected="true"]{background:var(--card);color:var(--ink);font-weight:600;box-shadow:0 1px 2px rgba(20,36,51,.12)}
 
 .card{background:var(--card);border:1px solid var(--line);border-radius:5px;padding:14px;margin-top:12px}
@@ -130,6 +130,19 @@ input,select{font-family:inherit;color:var(--ink)}
 .title{font-size:26px;font-weight:600;margin:6px 0 4px}
 .toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:var(--ink);color:#fff;
   padding:11px 18px;border-radius:4px;font-size:15px;z-index:9;box-shadow:0 3px 12px rgba(20,36,51,.3)}
+
+.subtle{font-size:13px;color:var(--ink-2)}
+.flag{font-size:14px;color:#7a4d12;background:#fff7e6;border:1px solid #e8d5a8;border-radius:4px;
+  padding:8px 10px;margin-top:10px}
+.thumb{display:block;width:100%;max-height:240px;object-fit:contain;background:#f2f5f6;
+  border:1px solid var(--line);border-radius:4px;margin-top:9px}
+.hrow{display:flex;align-items:center;gap:9px;width:100%;padding:9px 2px;border:0;border-bottom:1px solid #f4f6f7;
+  background:none;font-family:inherit;color:var(--ink);text-align:left;cursor:pointer}
+.hdate{font-size:13px;color:var(--ink-2);width:50px;flex:none}
+.hwhat{flex:1;min-width:0;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hamt{font-size:16px;font-weight:500;flex:none}
+.hdet{padding:9px 10px 12px 32px;background:#f7f9fa;border-bottom:1px solid #f4f6f7}
+.weeksub{display:block;font-size:13px;font-weight:400;color:var(--ink-2)}
 </style>
 </head>
 <body>
@@ -149,8 +162,13 @@ const DEFAULT_CATS = [
 ];
 const DAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
 
-let S=null, tab="pay", filter=null, openWeeks={}, confirmWipe=false, showRegulars=false,
+let S=null, tab="pay", filter=null, confirmWipe=false, showRegulars=false,
     moveMode=false, movePrefill=null, moveFrom="spend", moveTo="save", storageOK=true;
+/* receipt form state, kept out of the DOM so a re-render never loses a photo */
+let receiptMode=false, noGst=false, invoiceHeld=false, gstTouched=false, pendingPhoto=null;
+/* history and claimable views */
+let spendSub=null, claimFY="all", histFilter="all", histSearch="", openHist={}, openRows={};
+let idbOK=true, photoUrls={};
 
 /* ---------- helpers ---------- */
 const uid=()=>Math.random().toString(36).slice(2,9);
@@ -197,8 +215,12 @@ function migrate(o){
     o.investValues=(o.investValues||[]).map(v=>Object.assign({},v,{hid:hid}));
   }
   if(typeof o.payDay!=="number") o.payDay=3;
-  return Object.assign({income:[],expenses:[],recurring:[],owed:[],repayments:[],
-    investValues:[],holdings:[],categories:DEFAULT_CATS},o);
+  delete o.receiptPhotos;                 // a note to whoever opens the backup file, not state
+  /* Saves from before savings corrections existed simply have no list yet. */
+  const st=Object.assign({income:[],expenses:[],recurring:[],owed:[],repayments:[],
+    investValues:[],holdings:[],adjustments:[],categories:DEFAULT_CATS},o);
+  if(!Array.isArray(st.adjustments)) st.adjustments=[];
+  return st;
 }
 function load(){
   try{
@@ -213,12 +235,84 @@ function toast(m){ const t=document.createElement("div"); t.className="toast"; t
 
 const investOf=i=>{ let t=0; const m=i.invest||{}; for(const k in m) t+=m[k]; return t; };
 
+/* ---------- receipt photos ----------
+   Photos are blobs, and localStorage is a ~5MB string store — a handful of them would
+   blow it and take every figure down with it. So they live in IndexedDB, keyed by the
+   expense id, and nothing else about the app changes. If IndexedDB is blocked the
+   expense still saves, just without the picture, and it says so.
+   The seam for reading a receipt automatically is compress() -> a blob: hand that blob
+   to an OCR step later and fill the form from what comes back. Deliberately not built:
+   a cloud vision API means his receipts leave the phone, and an in-browser one is
+   megabytes of download that struggles with crumpled thermal paper. */
+const IDB_NAME="moneyweeks-receipts", IDB_STORE="photos";
+function idbOpen(){
+  return new Promise((res,rej)=>{
+    if(!idbOK||!self.indexedDB){ idbOK=false; rej(); return; }
+    let rq; try{ rq=indexedDB.open(IDB_NAME,1); }catch(e){ idbOK=false; rej(); return; }
+    rq.onupgradeneeded=()=>{ const db=rq.result;
+      if(!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE); };
+    rq.onsuccess=()=>res(rq.result);
+    rq.onerror=()=>{ idbOK=false; rej(rq.error); };
+  });
+}
+function idbDo(mode,fn){
+  return idbOpen().then(db=>new Promise((res,rej)=>{
+    let rq; try{ rq=fn(db.transaction(IDB_STORE,mode).objectStore(IDB_STORE)); }
+    catch(e){ rej(e); return; }
+    rq.onsuccess=()=>res(rq.result);
+    rq.onerror=()=>rej(rq.error);
+  }));
+}
+const photoPut=(id,blob)=>idbDo("readwrite",st=>st.put(blob,id));
+const photoGet=id=>idbDo("readonly",st=>st.get(id));
+const photoDel=id=>idbDo("readwrite",st=>st.delete(id));
+
+/* A phone camera hands back 4MB. Down to the long edge at 1600px and quality 0.7 a
+   receipt lands nearer 200KB, still easily readable. */
+function compress(file){
+  return new Promise((res,rej)=>{
+    const fr=new FileReader();
+    fr.onerror=()=>rej();
+    fr.onload=()=>{
+      const img=new Image();
+      img.onerror=()=>rej();
+      img.onload=()=>{
+        const long=Math.max(img.width,img.height), k=long>1600?1600/long:1;
+        const c=document.createElement("canvas");
+        c.width=Math.max(1,Math.round(img.width*k)); c.height=Math.max(1,Math.round(img.height*k));
+        c.getContext("2d").drawImage(img,0,0,c.width,c.height);
+        c.toBlob(b=>b?res(b):rej(),"image/jpeg",0.7);
+      };
+      img.src=fr.result;
+    };
+    fr.readAsDataURL(file);
+  });
+}
+const blobToData=b=>new Promise((res,rej)=>{const r=new FileReader();
+  r.onerror=()=>rej(); r.onload=()=>res(r.result); r.readAsDataURL(b)});
+function dataToBlob(u){
+  const c=u.indexOf(","), head=u.slice(0,c), bin=atob(u.slice(c+1));
+  const type=(/:(.*?);/.exec(head)||[,"image/jpeg"])[1];
+  const a=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) a[i]=bin.charCodeAt(i);
+  return new Blob([a],{type});
+}
+
+/* Australian GST is 10% built into the price, so the included part is a rounded eleventh. */
+const gstOf=total=>Math.round((total/11)*100)/100;
+const NEEDS_INVOICE=82.5;                       // ATO threshold for a valid tax invoice
+const fyOf=i=>{ const y=+i.slice(0,4), m=+i.slice(5,7); return m>=7?y+1:y; };
+const fyLabel=f=>(f-1)+"\u2013"+String(f).slice(2);   // 2025-26
+
 /* ---------- the two streams ---------- */
 function derive(){
   /* stream one: money set aside, which is what the goal is made of */
   const toSavings=S.income.reduce((s,i)=>s+i.toSavings,0);
   const repaid=S.repayments.reduce((s,r)=>s+r.amount,0);
-  const savings=toSavings+repaid;
+  /* Corrections true the balance up to the real account: a fee, some interest, a transfer
+     he forgot. They stay out of the weekly bars below — that isn't money he set aside. */
+  const adjusted=S.adjustments.reduce((s,a)=>s+a.amount,0);
+  const savings=toSavings+repaid+adjusted;
 
   /* each holding tracked on its own, then added up */
   const holdings=S.holdings.map(h=>{
@@ -262,7 +356,7 @@ function derive(){
   const rate=recent.length?recent.reduce((s,w)=>s+w.put,0)/recent.length:null;
 
   const owedTotal=S.owed.reduce((s,o)=>s+o.amount,0);
-  return {savings,repaid,invested,investVal,growth,holdings,goalTotal,wallet,billsPending,safe,
+  return {savings,repaid,adjusted,invested,investVal,growth,holdings,goalTotal,wallet,billsPending,safe,
     left,gap,required,weeks,rate,owedTotal,spent,
     projected: rate===null?null:goalTotal+rate*left};
 }
@@ -327,14 +421,20 @@ function screenSetup(){
     <button class="link" data-act="setup-add-hold">Add another</button>
     <p class="sub" style="margin-top:14px;margin-bottom:0">You'll put in what each one is worth right after this.</p>
   </div>
-  <button class="btn" data-act="start" style="margin-bottom:30px">Start tracking</button>`;
+  <button class="btn" data-act="start">Start tracking</button>
+  <p class="sub" style="margin:14px 0 30px;text-align:center">Done this before on another phone?
+    <button class="link" data-act="restore">Restore from a backup file</button><br>
+    <span class="subtle">Take the figures file first, then the receipts one if you have it.</span></p>
+  <input type="file" id="restore-file" accept="application/json,.json" style="display:none">`;
 }
 
 function screenMain(){
   const d=derive();
-  const body = tab==="pay"?viewPay(d):tab==="spend"?viewSpend(d):tab==="goal"?viewGoal(d)
-    :tab==="owed"?viewOwed(d):viewSetup();
-  const tabs=[["pay","Pay"],["spend","Spending"],["goal","Goal"],["owed","Owed"],["setup","Setup"]];
+  const body = tab==="pay"?viewPay(d)
+    :tab==="spend"?(spendSub==="claim"?viewClaim():viewSpend(d))
+    :tab==="goal"?viewGoal(d)
+    :tab==="history"?viewHistory():viewSetup();
+  const tabs=[["pay","Pay"],["spend","Spending"],["goal","Goal"],["history","History"],["setup","Setup"]];
   return warnBanner()+hero(d)+`<div class="tabs" role="tablist">`+
     tabs.map(([id,l])=>`<button class="tab" role="tab" data-act="tab" data-tab="${id}" aria-selected="${tab===id}">${l}</button>`).join("")+
     `</div>`+body;
@@ -423,21 +523,7 @@ function viewPay(d){
     <button class="link" data-act="move-mode">${moveMode?"Back to recording pay":"Move money between savings, investments and spending"}</button>
     ${ moveMode?`<p class="note">Moving into spending money doesn't count as spending. Log what you actually buy on the
       Spending tab as usual.</p>`:""}
-  </div>
-  <div class="card">
-    <h2>Recent pays</h2>
-    ${ S.income.length===0?`<div class="empty">Nothing recorded yet.</div>`
-      : S.income.slice().reverse().slice(0,12).map(i=>{
-          const inv=investOf(i);
-          return `<div class="exp">
-            <div class="expmain">
-              <div class="expwhat">${i.amount>0?money(i.amount)+" in":(i.moveLabel||"Moved across")}</div>
-              <div class="expmeta">${shortDate(i.date)}${ i.amount>0
-                ? " &middot; "+money(i.toSavings)+" savings, "+money(inv)+" invested, "+money(i.amount-i.toSavings-inv)+" to spend"
-                : ""}</div>
-            </div>
-            <button class="x" data-act="del-pay" data-id="${i.id}" aria-label="Delete">&times;</button>
-          </div>`;}).join("") }
+    ${ S.income.length?`<button class="link" data-act="tab" data-tab="history">See every pay and move in History</button>`:""}
   </div>`;
 }
 
@@ -451,7 +537,9 @@ function viewSpend(d){
   const thisWeek=groups.find(g=>g.week===weekEnd(today()));
   const last4=groups.slice(0,4);
   const avg=last4.length?last4.reduce((s,g)=>s+g.total,0)/last4.length:0;
-  const claimable=S.expenses.filter(e=>e.cat==="work").reduce((s,e)=>s+e.amount,0);
+  const claim=S.expenses.filter(e=>e.claimable);
+  const claimable=claim.reduce((s,e)=>s+e.amount,0);
+  const claimGst=claim.reduce((s,e)=>s+(e.gst||0),0);
 
   return `
   ${ due.length?`<div class="card due">
@@ -477,6 +565,9 @@ function viewSpend(d){
     <div class="chips" id="s-cats">${S.categories.map((c,i)=>`<button class="chip" data-act="pick-cat" data-id="${c.id}" aria-pressed="${i===0}"><span class="sw" style="background:${c.color}"></span>${esc(c.name)}</button>`).join("")}</div>
     <div class="row" style="margin-top:8px"><label for="s-date">When</label>
       <div class="money"><input id="s-date" class="in plain" type="date" value="${today()}"></div></div>
+    <button class="link" data-act="receipt-mode" id="rc-toggle">${receiptMode
+      ? "Not a work receipt after all" : "It's a work receipt \u2014 photo and GST"}</button>
+    ${receiptBlock()}
     <button class="btn" data-act="add-exp">Add expense</button>
     <button class="link" data-act="show-regulars">${showRegulars?"Hide bills":"Set up a regular bill"}</button>
     ${showRegulars?regularsBlock():""}
@@ -488,7 +579,8 @@ function viewSpend(d){
       <div class="splitline"><span>Weekly average lately</span><b class="num">${money(avg)}</b></div>
       <div class="splitline big"><span>Left to spend</span><b class="num ${d.safe<0?"down":""}">${money(d.safe)}</b></div>
     </div>
-    ${claimable>0?`<p class="note">${money(claimable)} logged as claimable work spending, all time.</p>`:""}
+    ${claim.length?`<p class="note">${money(claimable)} of claimable work spending, ${money(claimGst,true)} of GST in it.</p>`:""}
+    <button class="link" data-act="claim">Claimable spending and GST${claim.length?" ("+claim.length+")":""}</button>
     ${d.safe>0?`<button class="btn ghost" data-act="sweep">Move ${money(d.safe)} into savings</button>`:""}
     <button class="link" data-act="reconcile">The real figure is different, fix it</button>
     <div class="chips">
@@ -498,27 +590,97 @@ function viewSpend(d){
   </div>
 
   <div class="card">
-    <h2>Spending by week</h2>
-    ${ groups.length===0?`<div class="empty">${filter?"Nothing in that category yet.":"No expenses logged yet."}</div>`
-      : groups.map((g,gi)=>{
-        const isOpen=openWeeks[g.week]??(gi===0);
-        const byCat={}; g.items.forEach(e=>byCat[e.cat]=(byCat[e.cat]||0)+e.amount);
-        return `<div>
-          <button class="weekhead" data-act="toggle-week" data-week="${g.week}" aria-expanded="${isOpen}">
-            <span class="caret">${isOpen?"&#9662;":"&#9656;"}</span>
-            <span class="weekname">Week to ${shortDate(g.week)}</span>
-            <span class="weeksum num">${money(g.total)}</span></button>
-          ${isOpen?`<div class="stack">${Object.keys(byCat).map(id=>`<div style="width:${(byCat[id]/g.total)*100}%;background:${catOf(id).color}"></div>`).join("")}</div>
-            ${g.items.map(e=>`<div class="exp">
-              <span class="sw" style="background:${catOf(e.cat).color}"></span>
-              <div class="expmain"><div class="expwhat">${esc(e.what)}</div>
-                <div class="expmeta">${shortDate(e.date)} &middot; ${esc(catOf(e.cat).name)}</div></div>
-              <div class="expamt num">${money(e.amount,true)}</div>
-              <button class="again" data-act="again-exp" data-id="${e.id}" aria-label="Log again today">&#8635;</button>
-              <button class="x" data-act="del-exp" data-id="${e.id}" aria-label="Delete">&times;</button>
-            </div>`).join("")}`:""}
-        </div>`;}).join("") }
+    <h2>This pay week</h2>
+    <p class="sub">Week to ${shortDate(weekEnd(today()))}. Everything before it is in History.</p>
+    ${ !thisWeek?`<div class="empty">${filter?"Nothing in that category this week.":"Nothing spent this week yet."}</div>`
+      : `${(function(){const byCat={};thisWeek.items.forEach(e=>byCat[e.cat]=(byCat[e.cat]||0)+e.amount);
+          return `<div class="stack">${Object.keys(byCat).map(id=>`<div style="width:${(byCat[id]/thisWeek.total)*100}%;background:${catOf(id).color}"></div>`).join("")}</div>`;})()}
+        ${thisWeek.items.map(e=>`<div class="exp">
+          <span class="sw" style="background:${catOf(e.cat).color}"></span>
+          <div class="expmain"><div class="expwhat">${esc(e.what)}${e.photo?" \uD83D\uDCF7":""}</div>
+            <div class="expmeta">${shortDate(e.date)} &middot; ${esc(catOf(e.cat).name)}${
+              e.claimable?" &middot; claimable":""}</div></div>
+          <div class="expamt num">${money(e.amount,true)}</div>
+          <button class="again" data-act="again-exp" data-id="${e.id}" aria-label="Log again today">&#8635;</button>
+          <button class="x" data-act="del-exp" data-id="${e.id}" aria-label="Delete">&times;</button>
+        </div>`).join("")}` }
+    <button class="link" data-act="tab" data-tab="history">Every other week is in History</button>
     ${S.expenses.length?`<button class="btn ghost" data-act="csv">Download spending as a spreadsheet</button>`:""}
+  </div>`;
+}
+
+/* The receipt half of the expense form. It stays in the DOM and is shown or hidden in
+   place, so flicking it on never wipes an amount he has already typed. */
+function receiptBlock(){
+  return `<div id="rc-block"${receiptMode?"":" hidden"}>
+    <div style="padding:7px 0"><input id="s-sup" class="txt" placeholder="Who you paid, e.g. Bunnings" aria-label="Supplier"></div>
+    <div class="row"><label for="s-gst">GST included</label>
+      <div class="money"><span>$</span><input id="s-gst" class="in" inputmode="decimal" placeholder="0.00"></div></div>
+    <div class="chips" style="margin-top:2px">
+      <button class="chip" data-act="no-gst" aria-pressed="${noGst}">No GST on this</button>
+      <button class="chip" data-act="held" aria-pressed="${invoiceHeld}">I've got the tax invoice</button>
+    </div>
+    <div id="rc-flag" class="flag" hidden>Over ${money(NEEDS_INVOICE,true)}, so you need a proper tax invoice
+      before you can claim the GST. Keep it and tick it off above.</div>
+    <button class="btn ghost" data-act="snap">Photograph the receipt</button>
+    <input type="file" id="rc-file" accept="image/*" capture="environment" style="display:none">
+    <div id="rc-prev"></div>
+    <p class="note">GST is worked out as a rounded eleventh of the total, which is how it works here. Change it if
+      the receipt says something different, or say there's none \u2014 fresh food and most medical aren't taxed.</p>
+  </div>`;
+}
+
+/* ---------- claimable spending ---------- */
+function viewClaim(){
+  const all=S.expenses.filter(e=>e.claimable).sort((a,b)=>a.date<b.date?1:-1);
+  const years=[]; all.forEach(e=>{ const f=fyOf(e.date); if(years.indexOf(f)<0) years.push(f); });
+  years.sort().reverse();
+  const list=claimFY==="all"?all:all.filter(e=>fyOf(e.date)===+claimFY);
+  const total=list.reduce((s,e)=>s+e.amount,0), gst=list.reduce((s,e)=>s+(e.gst||0),0);
+  const short=list.filter(e=>e.amount>NEEDS_INVOICE&&!e.invoiceHeld).length;
+
+  return `<div class="card">
+    <button class="link" data-act="unclaim">&larr; Back to spending</button>
+    <h2>Claimable work spending</h2>
+    <p class="sub">Every expense you marked claimable, with the GST in it. Financial years run 1 July to 30 June.</p>
+    <div class="chips">
+      <button class="chip" data-act="fy" data-id="all" aria-pressed="${claimFY==="all"}">All time</button>
+      ${years.map(f=>`<button class="chip" data-act="fy" data-id="${f}" aria-pressed="${claimFY===String(f)}">${fyLabel(f)}</button>`).join("")}
+    </div>
+    <div class="split">
+      <div class="splitline"><span>Receipts</span><b class="num">${list.length}</b></div>
+      <div class="splitline"><span>GST in them</span><b class="num">${money(gst,true)}</b></div>
+      <div class="splitline big"><span>Spent, including GST</span><b class="num">${money(total,true)}</b></div>
+    </div>
+    ${short?`<div class="flag">${short===1?"One receipt is":short+" receipts are"} over ${money(NEEDS_INVOICE,true)}
+      without a tax invoice held. Tap it and tick it off once you've found the invoice.</div>`:""}
+    ${list.length?`<button class="btn ghost" data-act="claim-csv">Download for your accountant</button>`:""}
+  </div>
+
+  <div class="card">
+    ${ list.length===0?`<div class="empty">Nothing marked claimable${claimFY==="all"?" yet. Tick \u201cIt's a work receipt\u201d when you add an expense.":" in that year."}</div>`
+      : list.map(e=>{
+        const open=!!openRows[e.id], needs=e.amount>NEEDS_INVOICE&&!e.invoiceHeld;
+        return `<div>
+          <button class="hrow" data-act="toggle-row" data-id="${e.id}" aria-expanded="${open}">
+            <span class="hdate num">${shortDate(e.date)}</span>
+            <span class="hwhat">${esc(e.supplier||e.what)}${e.photo?" \uD83D\uDCF7":""}${needs?" \u26a0":""}
+              <span class="weeksub">${esc(e.what)} &middot; GST ${money(e.gst||0,true)}</span></span>
+            <span class="hamt num">${money(e.amount,true)}</span>
+          </button>
+          ${open?`<div class="hdet">
+            <div class="subtle">${esc(catOf(e.cat).name)} &middot; ${e.noGst?"no GST on this one":"GST "+money(e.gst||0,true)}
+              &middot; ${e.amount>NEEDS_INVOICE?(e.invoiceHeld?"tax invoice held":"needs a proper tax invoice"):"under "+money(NEEDS_INVOICE,true)+", a receipt is enough"}</div>
+            ${e.photo?`<img class="thumb" data-photo="${e.id}" alt="Photo of the receipt from ${esc(e.supplier||e.what)}">`:""}
+            <div style="display:flex;gap:8px;margin-top:10px">
+              <button class="mini${e.invoiceHeld?" solid":""}" data-act="held-toggle" data-id="${e.id}">${
+                e.invoiceHeld?"Tax invoice held":"Mark invoice held"}</button>
+              <button class="mini" data-act="del-exp" data-id="${e.id}">Delete</button>
+            </div>
+          </div>`:""}
+        </div>`;}).join("") }
+    <p class="note">This is a record of what you spent, not tax advice. What's actually claimable is between you
+      and your accountant.</p>
   </div>`;
 }
 
@@ -552,7 +714,15 @@ function viewGoal(d){
     <h2>What's in the goal</h2>
     <p class="sub">Savings and investments. Spending money never counts.</p>
     <div class="big" style="border-bottom:1px solid #eef1f2"><span class="k">Savings</span><span class="v num">${money(d.savings)}</span></div>
-    <div class="big"><span class="k">Investments, worth today</span><span class="v num">${money(d.investVal)}</span></div>
+    <div class="row" style="border-bottom:0;padding-top:2px"><label for="sav-real">Actually in the account</label>
+      <div class="money"><span>$</span><input id="sav-real" class="in" inputmode="decimal"
+        placeholder="${d.savings.toFixed(2)}"></div></div>
+    <button class="btn ghost" data-act="fix-savings" style="margin-top:6px">Correct the savings balance</button>
+    <p class="note">A fee, some interest, a transfer you forgot &mdash; put in the real figure and it records the
+      difference, so nothing already entered is lost.${d.adjusted?" Corrections so far: "+
+        (d.adjusted>0?"+":"")+money(d.adjusted,true)+".":""} A correction isn't money you put away, so it stays out
+      of the weekly bars.</p>
+    <div class="big" style="border-top:1px solid #eef1f2;margin-top:10px"><span class="k">Investments, worth today</span><span class="v num">${money(d.investVal)}</span></div>
     <div class="split">
       <div class="splitline"><span>Of your savings, paid back to you</span><b class="num">${money(d.repaid)}</b></div>
       <div class="splitline"><span>Put into investments</span><b class="num">${money(d.invested)}</b></div>
@@ -596,7 +766,8 @@ function viewGoal(d){
       <div class="splitline big"><span>Putting away lately</span><b class="num">${d.rate===null?"&mdash;":money(d.rate)}</b></div>
     </div>
     ${d.projected!==null&&d.left>0?`<p class="note">At this rate you'll have <strong>${money(d.projected)}</strong> by ${shortDate(S.deadline)}.</p>`:""}
-  </div>`;
+  </div>
+  `+viewOwed(d);
 }
 
 /* ---------- owed ---------- */
@@ -631,6 +802,101 @@ function viewOwed(d){
     <p class="note">${money(d.repaid)} in total, counted in your savings.</p></div>`:""}`;
 }
 
+/* ---------- history ---------- */
+const HIST=[["all","All"],["in","Money in"],["out","Spending"],["move","Moves"],["inv","Investments"]];
+const HCOL={in:"#176b5c",out:"#b23f2a",move:"#4a6d8c",inv:"#8a6bbf"};
+
+/* One timeline out of every list. Nothing here derives a figure — it only reports what
+   was recorded, so a row can be deleted straight from it. */
+function events(){
+  const out=[];
+  S.income.forEach(i=>{
+    const inv=investOf(i);
+    if(i.amount>0) out.push({id:i.id,del:"del-pay",type:"in",date:i.date,amount:i.amount,
+      what:i.opening?"Opening balance":"Pay",
+      detail:money(i.toSavings,true)+" to savings \u00b7 "+money(inv,true)+" invested \u00b7 "+
+        money(i.amount-i.toSavings-inv,true)+" to spend"});
+    else out.push({id:i.id,del:"del-pay",type:"move",date:i.date,amount:null,
+      what:i.moveLabel||"Moved across",
+      detail:"Money changed pots. Nothing came in and nothing was spent."});
+  });
+  S.expenses.forEach(e=>out.push({id:e.id,del:"del-exp",type:"out",date:e.date,amount:-e.amount,
+    what:e.what,hunt:e.supplier||"",photo:!!e.photo,
+    detail:catOf(e.cat).name+(e.bill?" \u00b7 regular bill":"")+(e.supplier?" \u00b7 "+e.supplier:"")+
+      (e.claimable?" \u00b7 claimable, GST "+money(e.gst||0,true):"")}));
+  S.repayments.forEach(r=>out.push({id:r.id,del:"del-repaid",type:"in",date:r.date,amount:r.amount,
+    what:r.who+" paid you back",hunt:r.who,detail:"Into savings, and off what they owed you."}));
+  S.investValues.forEach(v=>{ const h=S.holdings.find(x=>x.id===v.hid);
+    out.push({id:v.id,del:"del-val",type:"inv",date:v.date,amount:null,
+      what:(h?h.name:"An investment")+" valued at "+money(v.value),
+      detail:"What it was worth that day. Valuing doesn't move any money."}); });
+  S.adjustments.forEach(a=>out.push({id:a.id,del:"del-adj",type:"inv",date:a.date,amount:null,
+    what:"Savings correction "+(a.amount>=0?"+":"\u2212")+money(Math.abs(a.amount),true),
+    detail:(a.note?a.note+". ":"")+"A correction, not money you put away."}));
+  return out.sort((a,b)=>a.date===b.date?0:(a.date<b.date?1:-1));
+}
+
+function viewHistory(){
+  return `<div class="card">
+    <h2>History</h2>
+    <p class="sub">Everything you've recorded, newest first, a pay week at a time. Tap a line for the detail.</p>
+    <div class="chips">${HIST.map(([id,l])=>`<button class="chip" data-act="hfilter" data-id="${id}"
+      aria-pressed="${histFilter===id}">${l}</button>`).join("")}</div>
+    <div style="padding:8px 0 2px"><input id="h-search" class="txt" placeholder="Search what and who"
+      value="${esc(histSearch)}" aria-label="Search history"></div>
+    <div id="hist-body">${histBody()}</div>
+  </div>`;
+}
+
+/* Rendered on its own so typing in the search box can refresh the list without a
+   re-render taking the keyboard with it. */
+function histBody(){
+  const q=histSearch.trim().toLowerCase();
+  const list=events().filter(e=>(histFilter==="all"||e.type===histFilter)&&
+    (!q||(e.what+" "+(e.hunt||"")+" "+e.detail).toLowerCase().indexOf(q)>-1));
+  if(!list.length) return `<div class="empty">${q||histFilter!=="all"?"Nothing matches that."
+    :"Nothing recorded yet."}</div>`;
+  const map={}; list.forEach(e=>{ const k=weekEnd(e.date); (map[k]=map[k]||[]).push(e); });
+  const now=weekEnd(today());
+  return Object.keys(map).sort().reverse().map(k=>{
+    /* Searching or filtering means he's looking for something, so the weeks that still
+       have rows in them open up rather than making him tap through each one. */
+    const items=map[k], open=openHist[k]??(k===now||!!q||histFilter!=="all");
+    let inn=0, out=0, put=0;
+    items.forEach(e=>{ if(e.amount>0) inn+=e.amount; if(e.amount<0) out-=e.amount; });
+    /* Put away is read off the real lists, not the filtered rows, so the week still
+       summarises itself honestly while a filter is on. */
+    S.income.forEach(i=>{ if(weekEnd(i.date)===k) put+=i.toSavings+investOf(i); });
+    S.repayments.forEach(r=>{ if(weekEnd(r.date)===k) put+=r.amount; });
+    return `<div>
+      <button class="weekhead" data-act="toggle-hist" data-week="${k}" aria-expanded="${open}">
+        <span class="caret">${open?"&#9662;":"&#9656;"}</span>
+        <span class="weekname">Week to ${shortDate(k)}${k===now?" &middot; this week":""}
+          <span class="weeksub">in ${money(inn)} &middot; out ${money(out)} &middot; put away ${money(put)}</span></span>
+      </button>
+      ${open?items.map(histRow).join(""):""}
+    </div>`;
+  }).join("");
+}
+
+function histRow(e){
+  const open=!!openRows[e.id];
+  return `<div>
+    <button class="hrow" data-act="toggle-row" data-id="${e.id}" aria-expanded="${open}">
+      <span class="sw" style="background:${HCOL[e.type]}"></span>
+      <span class="hdate num">${shortDate(e.date)}</span>
+      <span class="hwhat">${esc(e.what)}${e.photo?" \uD83D\uDCF7":""}</span>
+      <span class="hamt num ${e.amount<0?"down":e.amount>0?"up":""}">${
+        e.amount==null?"":(e.amount>0?"+":"\u2212")+money(Math.abs(e.amount),true)}</span>
+    </button>
+    ${open?`<div class="hdet">
+      <div class="subtle">${esc(e.detail)}</div>
+      ${e.photo?`<img class="thumb" data-photo="${e.id}" alt="Photo of the receipt">`:""}
+      <button class="mini" data-act="${e.del}" data-id="${e.id}" style="margin-top:10px">Delete this</button>
+    </div>`:""}
+  </div>`;
+}
+
 /* ---------- setup ---------- */
 function viewSetup(){
   return `<div class="card">
@@ -659,7 +925,12 @@ function viewSetup(){
     <h2>Keeping your data safe</h2>
     <p class="sub">Everything lives on this device only. Back it up now and then, and always before changing phones.</p>
     <button class="btn ghost" data-act="backup">Download a backup file</button>
+    <button class="btn ghost" data-act="backup-photos">Download your receipt photos${
+      photoCount()?" ("+photoCount()+")":""}</button>
     <button class="btn ghost" data-act="restore">Restore from a backup file</button>
+    <p class="note"><strong>The backup file holds every figure but no receipt photos.</strong> Photos are pictures,
+      not numbers, so they come in their own much larger file. Take both if you want the lot. Restoring accepts
+      either file and tells you which one it just put back.</p>
     <input type="file" id="restore-file" accept="application/json,.json" style="display:none">
     ${ !confirmWipe?`<button class="btn danger" data-act="ask-wipe">Start over</button>`
       :`<p class="note">This deletes everything. It can't be undone.</p>
@@ -699,24 +970,85 @@ function download(name,text,type){
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(u),1000);
 }
 
+/* GST follows the total until he types over it, and the tax-invoice warning appears
+   the moment the total crosses the threshold. */
+function updateGst(){
+  const amt=num(val("s-amt")), g=document.getElementById("s-gst"), f=document.getElementById("rc-flag");
+  if(g&&!gstTouched) g.value=noGst?"0.00":(amt>0?gstOf(amt).toFixed(2):"");
+  if(f) f.hidden=!(receiptMode&&amt>NEEDS_INVOICE&&!invoiceHeld);
+}
+function resetReceipt(){
+  receiptMode=false; noGst=false; invoiceHeld=false; gstTouched=false;
+  if(pendingPhoto&&pendingPhoto.url) URL.revokeObjectURL(pendingPhoto.url);
+  pendingPhoto=null;
+}
+function showPhoto(){
+  const box=document.getElementById("rc-prev"); if(!box) return;
+  box.innerHTML=pendingPhoto?`<img class="thumb" src="${pendingPhoto.url}" alt="The receipt you just photographed">
+    <button class="link" data-act="unsnap">Remove this photo</button>
+    <span class="subtle"> ${Math.round(pendingPhoto.blob.size/1024)}KB</span>`:"";
+}
+
 function wire(){
   document.querySelectorAll(".pcalc").forEach(i=>i.addEventListener("input",updateSplit));
   const mf=document.getElementById("m-from"), mt=document.getElementById("m-to");
   if(mf) mf.addEventListener("change",()=>{ moveFrom=mf.value; });
   if(mt) mt.addEventListener("change",()=>{ moveTo=mt.value; });
   updateSplit();
+
+  const sa=document.getElementById("s-amt"), sg=document.getElementById("s-gst");
+  if(sa) sa.addEventListener("input",updateGst);
+  if(sg) sg.addEventListener("input",()=>{ gstTouched=true; });
+  showPhoto(); updateGst();
+
+  const rcf=document.getElementById("rc-file");
+  if(rcf) rcf.addEventListener("change",e=>{
+    const f=e.target.files[0]; e.target.value=""; if(!f) return;
+    toast("Shrinking the photo\u2026");
+    compress(f).then(b=>{
+      if(pendingPhoto&&pendingPhoto.url) URL.revokeObjectURL(pendingPhoto.url);
+      pendingPhoto={blob:b,url:URL.createObjectURL(b)}; showPhoto();
+    }).catch(()=>toast("Couldn't read that photo"));
+  });
+
+  const hs=document.getElementById("h-search");
+  if(hs) hs.addEventListener("input",()=>{ histSearch=hs.value;
+    const body=document.getElementById("hist-body"); if(body) body.innerHTML=histBody(); });
+
+  /* Stored receipts load out of IndexedDB after the view is on screen. */
+  document.querySelectorAll("img[data-photo]").forEach(img=>{
+    const id=img.dataset.photo;
+    if(photoUrls[id]){ img.src=photoUrls[id]; return; }
+    photoGet(id).then(b=>{
+      if(b){ photoUrls[id]=URL.createObjectURL(b); img.src=photoUrls[id]; }
+      else{ const n=document.createElement("div"); n.className="subtle";
+        n.textContent="That photo isn't on this device."; img.replaceWith(n); }
+    }).catch(()=>{ const n=document.createElement("div"); n.className="subtle";
+      n.textContent="This browser won't open stored photos."; img.replaceWith(n); });
+  });
+
   const rf=document.getElementById("restore-file");
   if(rf) rf.addEventListener("change",e=>{
-    const f=e.target.files[0]; if(!f) return;
+    const f=e.target.files[0]; e.target.value=""; if(!f) return;
     const r=new FileReader();
     r.onload=()=>{ try{
       const data=JSON.parse(r.result);
+      if(data&&data.type==="money-weeks-receipts"&&data.photos){
+        const ids=Object.keys(data.photos);
+        Promise.all(ids.map(id=>photoPut(id,dataToBlob(data.photos[id]))))
+          .then(()=>{ photoUrls={}; render(); toast(ids.length+" receipt photos restored"); })
+          .catch(()=>toast("This browser wouldn't store the photos"));
+        return;
+      }
       if(!data.goal||!data.income) throw new Error("bad");
-      S=migrate(data); save(); render(); toast("Backup restored");
+      S=migrate(data); save(); render();
+      toast("Figures restored. Receipt photos come in their own file.");
     }catch(err){ toast("That isn't a Money Weeks backup"); } };
     r.readAsText(f);
   });
 }
+
+const photoCount=()=>S?S.expenses.filter(e=>e.photo).length:0;
 
 function readHoldLines(sel){
   return Array.prototype.map.call(document.querySelectorAll(sel+" .line"),el=>({
@@ -739,13 +1071,14 @@ document.getElementById("app").addEventListener("click",e=>{
     const sav=num(val("u-sav")), wal=num(val("u-wal"));
     S={goal:num(val("u-goal")), deadline:val("u-date"), payDay:parseInt(val("u-payday"),10)||0,
        categories:DEFAULT_CATS, holdings:readHoldLines("#setup-holds"),
-       income:[], expenses:[], recurring:[], owed:[], repayments:[], investValues:[]};
+       income:[], expenses:[], recurring:[], owed:[], repayments:[], investValues:[], adjustments:[]};
     if(sav||wal) S.income.push({id:uid(), date:today(), amount:sav+wal, toSavings:sav, invest:{}, opening:true});
     save(); tab = S.holdings.length ? "goal" : "pay"; render();
     if(S.holdings.length) toast("Now put in what each investment is worth");
     return;
   }
-  if(act==="tab"){ tab=btn.dataset.tab; moveMode=false; movePrefill=null; render(); return; }
+  if(act==="tab"){ tab=btn.dataset.tab; moveMode=false; movePrefill=null; spendSub=null;
+    openRows={}; render(); return; }
   if(act==="move-mode"){ moveMode=!moveMode; if(!moveMode) movePrefill=null; render(); return; }
   if(act==="sweep"){
     const d=derive();
@@ -789,6 +1122,31 @@ document.getElementById("app").addEventListener("click",e=>{
   }
   if(act==="del-pay"){ S.income=S.income.filter(i=>i.id!==btn.dataset.id); save(); render(); return; }
 
+  if(act==="receipt-mode"){
+    receiptMode=!receiptMode;
+    const block=document.getElementById("rc-block");
+    if(block) block.hidden=!receiptMode;
+    btn.textContent=receiptMode?"Not a work receipt after all":"It's a work receipt \u2014 photo and GST";
+    /* Work spending is nearly always the work category, so put him there without a fuss. */
+    if(receiptMode&&S.categories.some(c=>c.id==="work")){
+      const chips=document.querySelectorAll('#s-cats .chip');
+      chips.forEach(c=>c.setAttribute("aria-pressed",String(c.dataset.id==="work")));
+    }
+    updateGst(); return;
+  }
+  if(act==="no-gst"){
+    noGst=!noGst; btn.setAttribute("aria-pressed",String(noGst));
+    gstTouched=false; updateGst(); return;
+  }
+  if(act==="held"){
+    invoiceHeld=!invoiceHeld; btn.setAttribute("aria-pressed",String(invoiceHeld)); updateGst(); return;
+  }
+  if(act==="snap"){ const f=document.getElementById("rc-file"); if(f) f.click(); return; }
+  if(act==="unsnap"){
+    if(pendingPhoto&&pendingPhoto.url) URL.revokeObjectURL(pendingPhoto.url);
+    pendingPhoto=null; showPhoto(); return;
+  }
+
   if(act==="pick-cat"||act==="pick-rcat"){
     btn.closest(".chips").querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed","false"));
     btn.setAttribute("aria-pressed","true"); return;
@@ -797,16 +1155,56 @@ document.getElementById("app").addEventListener("click",e=>{
     const a=num(val("s-amt")); if(a<=0){ toast("Put an amount in first"); return; }
     const p=document.querySelector('#s-cats .chip[aria-pressed="true"]');
     const cat=p?p.dataset.id:S.categories[0].id;
-    S.expenses.push({id:uid(), date:val("s-date")||today(), amount:a,
-      what:val("s-what").trim()||catOf(cat).name, cat});
-    save(); render(); toast("Added"); return;
+    const e2={id:uid(), date:val("s-date")||today(), amount:a,
+      what:val("s-what").trim()||catOf(cat).name, cat};
+    if(receiptMode){
+      e2.claimable=true;
+      e2.supplier=val("s-sup").trim()||e2.what;
+      e2.noGst=noGst;
+      e2.gst=noGst?0:Math.round(num(val("s-gst"))*100)/100;
+      e2.invoiceHeld=invoiceHeld;
+    }
+    const blob=receiptMode&&pendingPhoto?pendingPhoto.blob:null;
+    const done=m=>{ resetReceipt(); save(); render(); toast(m); };
+    S.expenses.push(e2);
+    if(blob){
+      e2.photo=true;
+      photoPut(e2.id,blob).then(()=>done("Receipt saved"))
+        .catch(()=>{ delete e2.photo; done("Saved, but this browser wouldn't keep the photo"); });
+    }else done(receiptMode?"Receipt saved":"Added");
+    return;
   }
-  if(act==="del-exp"){ S.expenses=S.expenses.filter(x=>x.id!==btn.dataset.id); save(); render(); return; }
+  if(act==="del-exp"){
+    const gone=S.expenses.find(x=>x.id===btn.dataset.id);
+    if(gone&&gone.photo){ photoDel(gone.id).catch(()=>{});
+      if(photoUrls[gone.id]){ URL.revokeObjectURL(photoUrls[gone.id]); delete photoUrls[gone.id]; } }
+    S.expenses=S.expenses.filter(x=>x.id!==btn.dataset.id); save(); render(); return; }
   if(act==="again-exp"){ const e2=S.expenses.find(x=>x.id===btn.dataset.id);
-    if(e2){ S.expenses.push(Object.assign({},e2,{id:uid(),date:today()})); save(); render(); toast("Logged again"); } return; }
+    /* Same shop, same amount, today — but its own receipt, so the photo doesn't come along. */
+    if(e2){ const copy=Object.assign({},e2,{id:uid(),date:today()});
+      delete copy.photo; delete copy.invoiceHeld;
+      S.expenses.push(copy); save(); render(); toast("Logged again"); } return; }
+  if(act==="held-toggle"){
+    const e2=S.expenses.find(x=>x.id===btn.dataset.id);
+    if(e2){ e2.invoiceHeld=!e2.invoiceHeld; save(); render(); } return; }
+  if(act==="claim"){ spendSub="claim"; openRows={}; render(); return; }
+  if(act==="unclaim"){ spendSub=null; openRows={}; render(); return; }
+  if(act==="fy"){ claimFY=btn.dataset.id; render(); return; }
+  if(act==="claim-csv"){
+    const all=S.expenses.filter(e=>e.claimable&&(claimFY==="all"||fyOf(e.date)===+claimFY))
+      .sort((a,b)=>a.date<b.date?-1:1);
+    const rows=[["Date","Supplier","Description","Total","GST","Tax invoice held"]].concat(
+      all.map(e=>[e.date, e.supplier||"", e.what, e.amount.toFixed(2), (e.gst||0).toFixed(2),
+        e.amount>NEEDS_INVOICE?(e.invoiceHeld?"Yes":"No"):"Not required"]));
+    download("claimable-"+(claimFY==="all"?"all":fyLabel(+claimFY))+"-"+today()+".csv",
+      rows.map(r=>r.map(c=>'"'+String(c).replace(/"/g,'""')+'"').join(",")).join("\n"),"text/csv");
+    toast("Downloaded"); return;
+  }
   if(act==="filter"){ filter=btn.dataset.id||null; render(); return; }
-  if(act==="toggle-week"){ const w=btn.dataset.week;
-    openWeeks[w]=!(openWeeks[w]??(btn.getAttribute("aria-expanded")==="true")); render(); return; }
+  if(act==="hfilter"){ histFilter=btn.dataset.id; render(); return; }
+  if(act==="toggle-hist"){ const w=btn.dataset.week;
+    openHist[w]=!(openHist[w]??(btn.getAttribute("aria-expanded")==="true")); render(); return; }
+  if(act==="toggle-row"){ const id=btn.dataset.id; openRows[id]=!openRows[id]; render(); return; }
   if(act==="reconcile"){
     const d=derive();
     const said=prompt("How much have you actually got left to spend?", Math.max(0,d.safe).toFixed(2));
@@ -837,16 +1235,30 @@ document.getElementById("app").addEventListener("click",e=>{
   if(act==="log-due"||act==="skip-due"){
     const item=dueList()[parseInt(btn.dataset.i,10)]; if(!item) return;
     const r=S.recurring.find(x=>x.id===item.r.id);
-    if(act==="log-due") S.expenses.push({id:uid(), date:item.date, amount:r.amount, what:r.name, cat:r.cat});
+    if(act==="log-due") S.expenses.push({id:uid(), date:item.date, amount:r.amount, what:r.name, cat:r.cat, bill:true});
     r.next=advance(item.date,r.freq); save(); render();
     toast(act==="log-due"?"Paid":"Skipped"); return;
   }
   if(act==="log-all-due"){
     dueList().forEach(item=>{ const r=S.recurring.find(x=>x.id===item.r.id);
-      S.expenses.push({id:uid(), date:item.date, amount:r.amount, what:r.name, cat:r.cat});
+      S.expenses.push({id:uid(), date:item.date, amount:r.amount, what:r.name, cat:r.cat, bill:true});
       r.next=advance(item.date,r.freq); });
     save(); render(); toast("All logged"); return;
   }
+
+  if(act==="fix-savings"){
+    const d=derive(), said=val("sav-real");
+    if(said.trim()===""){ toast("Type what's actually in the account"); return; }
+    const real=num(said), diff=Math.round((real-d.savings)*100)/100;
+    if(!diff){ toast("Already matches"); return; }
+    /* The delta is stored, never the new total, so the history behind it stays intact
+       and the correction can be deleted like anything else. */
+    S.adjustments.push({id:uid(), date:today(), amount:diff,
+      note:"Corrected from "+money(d.savings,true)+" to "+money(real,true)});
+    save(); render(); toast(diff>0?money(diff,true)+" added":money(-diff,true)+" taken off"); return;
+  }
+  if(act==="del-adj"){ S.adjustments=S.adjustments.filter(a=>a.id!==btn.dataset.id); save(); render(); return; }
+  if(act==="del-val"){ S.investValues=S.investValues.filter(v=>v.id!==btn.dataset.id); save(); render(); return; }
 
   if(act==="save-values"){
     const date=val("v-date")||today(); let n=0;
@@ -896,13 +1308,33 @@ document.getElementById("app").addEventListener("click",e=>{
     }).filter(c=>c.name);
     save(); render(); toast("Saved"); return;
   }
-  if(act==="backup"){ download("money-weeks-backup-"+today()+".json",JSON.stringify(S,null,2));
-    if(S){ S.lastBackup=today(); save(); render(); } toast("Backup downloaded"); return; }
+  if(act==="backup"){
+    download("money-weeks-backup-"+today()+".json",
+      JSON.stringify(Object.assign({},S,
+        {receiptPhotos:"not in this file - use Download your receipt photos for those"}),null,2));
+    if(S){ S.lastBackup=today(); save(); render(); }
+    toast(photoCount()?"Figures saved. Photos are a separate file.":"Backup downloaded"); return; }
+  if(act==="backup-photos"){
+    const withPhoto=S.expenses.filter(e=>e.photo);
+    if(!withPhoto.length){ toast("No receipt photos yet"); return; }
+    toast("Gathering "+withPhoto.length+" photos\u2026");
+    Promise.all(withPhoto.map(e=>photoGet(e.id).then(b=>b?blobToData(b).then(u=>[e.id,u]):null)
+      .catch(()=>null)))
+      .then(pairs=>{
+        const photos={}; pairs.forEach(x=>{ if(x) photos[x[0]]=x[1]; });
+        const n=Object.keys(photos).length;
+        if(!n){ toast("Couldn't read the photos back"); return; }
+        download("money-weeks-receipts-"+today()+".json",
+          JSON.stringify({type:"money-weeks-receipts",saved:today(),photos}));
+        toast(n+" receipt photos downloaded");
+      }).catch(()=>toast("Couldn't read the photos back"));
+    return; }
   if(act==="restore"){ document.getElementById("restore-file").click(); return; }
   if(act==="ask-wipe"){ confirmWipe=true; render(); return; }
   if(act==="cancel-wipe"){ confirmWipe=false; render(); return; }
   if(act==="wipe"){ localStorage.removeItem(KEY); localStorage.removeItem(OLD_KEY);
-    S=null; confirmWipe=false; tab="pay"; render(); return; }
+    if(S) S.expenses.forEach(e=>{ if(e.photo) photoDel(e.id).catch(()=>{}); });
+    photoUrls={}; S=null; confirmWipe=false; tab="pay"; spendSub=null; render(); return; }
 });
 
 probeStorage(); load(); render();

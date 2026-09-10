@@ -2,7 +2,7 @@
 
 A weekly savings, spending and investment tracker for one person. Single page, no
 backend, no accounts, no build step, no dependencies. State lives in `localStorage`
-on the user's own device.
+on the user's own device, with receipt photos in IndexedDB beside it.
 
 Built for one person on an Android phone, paid on a fixed weekday, holding several
 investments that they move money between often. The target is a savings goal by a
@@ -25,12 +25,12 @@ money is set aside, minus spending and what bills take. It rolls over week to we
 
 The two never mix by accident. Logging an expense can never change the goal. Setting
 money aside can never look like spending. Every figure on screen is derived from
-three lists: allocations, expenses, valuations.
+four lists: allocations, expenses, valuations, corrections.
 
 ### Derived quantities
 
 ```
-savings     = Σ income.toSavings + Σ repayments.amount
+savings     = Σ income.toSavings + Σ repayments.amount + Σ adjustments.amount
 holding.put = Σ income.invest[holdingId]              // negative entries = sold down
 holding.value = lastValuation
                 ? lastValuation.value + Σ contributions dated after it
@@ -43,6 +43,9 @@ safe        = wallet − billsPending                    // the "left to spend" 
 required    = (goal − goalTotal) / weeks remaining
 rate        = mean of the last 4 pay weeks' (toSavings + invest + repayments)
 ```
+
+Note what `rate` leaves out: `adjustments`. A correction is not money he set aside, so it
+moves `savings` and the goal but never the weekly bars. See rules 4 and 5.
 
 Weeks run payday to the day before the next payday — Wednesday to Tuesday by default,
 set by `payDay` (0=Sunday). `weekEnd()` derives the boundary; don't hardcode Sunday.
@@ -80,15 +83,28 @@ is subtle and was a real bug — see the checklist.
 `dueList()` generates every missed occurrence up to today, capped at 60 iterations.
 Auto-posting a bill that didn't go out puts the wallet permanently out of step.
 
-**4. Money owed sits outside the goal.** It counts when it's actually received, at
+**4. Savings corrections store the delta, never the new total.** Typing "actually it's
+$12,340" writes one `adjustments` entry for the difference. Overwriting a total instead
+would erase the history behind it and leave nothing to delete when he gets it wrong.
+
+**5. A correction is not money put away.** It changes `savings`, so it changes the goal,
+but it stays out of the weekly bars and out of `rate`. A bank fee or a forgotten transfer
+flattering "put away each week" is how the dashboard stops meaning anything.
+
+**6. Receipt photos live in IndexedDB, never localStorage.** localStorage is a ~5MB
+string store holding every figure in the app; a handful of photos would blow it and take
+the rest down with it. Photos are blobs in their own database, keyed by expense id, and
+the expense still saves without one if IndexedDB is blocked.
+
+**7. Money owed sits outside the goal.** It counts when it's actually received, at
 which point it lands in savings via a `repayments` entry.
 
-**5. Nothing leaves the device.** No analytics, no network calls, no CDN beyond the
+**8. Nothing leaves the device.** No analytics, no network calls, no CDN beyond the
 Google Fonts import, which degrades to a system font offline. `probeStorage()` runs
 at boot and shows a banner if storage is blocked rather than losing data quietly.
 Backup and restore are JSON file download and upload.
 
-**6. `safe`, not `wallet`, is what's shown.** Bills falling due before the next
+**9. `safe`, not `wallet`, is what's shown.** Bills falling due before the next
 payday are already subtracted, so "left to spend" is money that's genuinely available.
 
 ## Data shape
@@ -105,14 +121,23 @@ payday are already subtracted, so "left to spend" is money that's genuinely avai
   recurring:  [{ id, name, amount, freq, next, cat }],   // weekly|fortnightly|monthly
   owed:       [{ id, who, amount }],
   repayments: [{ id, date, who, amount }],
+  adjustments:[{ id, date, amount, note }],    // savings corrections; amount is the delta
   investValues:[{ id, date, hid, value }],     // manual valuations, sorted by date
   categories: [{ id, name, color }]
 }
 ```
 
+An expense is `{ id, date, amount, what, cat }` plus, when it came off a bill, `bill: true`,
+and when it's a work receipt: `supplier`, `gst`, `noGst`, `claimable`, `invoiceHeld`, and
+`photo: true` if a picture of it is in IndexedDB under the same id.
+
 `KEY` is `moneyweeks:v4`; `load()` migrates a `v3` save by folding its single lump of
 investments into one holding. Bump `KEY` only alongside a migration, or existing
-users lose everything.
+users lose everything. New lists are added by giving `migrate()` an empty default, which
+is how `adjustments` arrived without a bump.
+
+Photos are separate: database `moneyweeks-receipts`, store `photos`, one JPEG blob per
+expense id. Nothing derives from it — it is only ever displayed.
 
 ## Architecture
 
@@ -121,6 +146,15 @@ Inputs are uncontrolled and read from the DOM on submit, so a re-render never fi
 the keyboard. All clicks go through one delegated listener keyed by `data-act`.
 Adding a feature means: a view function, a `data-act` branch, and a field in the
 shape above.
+
+Five tabs is the ceiling at 380px: Pay, Spending, Goal, History, Setup. Owed is a section
+on Goal, and the claimable view is a sub-screen of Spending (`spendSub`). Each thing lives
+in one place — History is the only full list of past activity, and the Spending tab shows
+the current week only.
+
+Two exceptions to "`render()` rebuilds everything": the receipt half of the expense form
+is shown and hidden in place, and the History search box refills only `#hist-body`. Both
+exist so a re-render can't take away something already typed.
 
 `addMonths()` clamps to the end of short months — 31 Jan rolls to 28 Feb, not 3 Mar.
 Don't swap it for a bare `setMonth()`.
@@ -132,6 +166,8 @@ Don't swap it for a bare `setMonth()`.
 | `index.html` | The whole app. HTML, CSS and JS in one file, on purpose. |
 | `manifest.webmanifest` | Makes it installable to the home screen. |
 | `sw.js` | Service worker, cache-first, so it opens with no signal. |
+| backup `.json` | Every figure, no photos. Says so in the file. |
+| receipts `.json` | Photos only, base64, much larger. Restore takes either. |
 | `icon-*.png` | App icons. |
 
 Static host, served over **https** (or `localhost`) or the service worker won't
@@ -162,9 +198,15 @@ No test harness. These are the cases that have actually broken:
 7. Someone repays part of what they owe → savings rises, the debt falls, the goal was
    never inflated beforehand.
 8. Sum check: savings + investments + spending money = paid in + growth − spent.
-9. Backup, wipe, restore → everything returns.
-10. Airplane mode from the home screen → still opens.
-11. **Dates must not shift by a day.** Every date helper formats from local
+9. Backup, wipe, restore → everything returns. Restore is offered on the first-run
+   screen too, which is the only place a new phone can reach it.
+10. Photograph a receipt over $82.50: GST fills in as a rounded eleventh, the tax-invoice
+   flag appears, the photo lands near 200KB in IndexedDB, and the goal doesn't move.
+   Tick "no GST" and it zeroes. Delete the expense and the photo goes with it.
+11. Correct the savings balance: savings and the goal move by the difference, spending
+   money doesn't, and **the weekly bars are unchanged**.
+12. Airplane mode from the home screen → still opens.
+13. **Dates must not shift by a day.** Every date helper formats from local
     calendar components via `isoLocal()`. Building one with
     `new Date(...).toISOString().slice(0,10)` parses at local midnight and then
     converts to UTC, which rolls back a day in any UTC-positive timezone. That
@@ -175,6 +217,11 @@ No test harness. These are the cases that have actually broken:
 
 ## Worth building next
 
+- Reading a receipt automatically. The seam is `compress()` — it hands back a JPEG blob,
+  which is what any OCR step would want. Left unbuilt on purpose: a cloud vision API means
+  his receipts leave the phone and an API key sits in a public repo, and an in-browser
+  library is megabytes of download that struggles with crumpled thermal paper, all to save
+  about fifteen seconds of typing.
 - Import from CSV, to bring in existing spreadsheet history.
 - Per-category weekly budget targets, shown against actuals.
 - A "what if" line: the weekly rate needed if the deadline moves.
