@@ -132,6 +132,16 @@ input,select{font-family:inherit;color:var(--ink)}
   padding:11px 18px;border-radius:4px;font-size:15px;z-index:9;box-shadow:0 3px 12px rgba(20,36,51,.3)}
 
 .subtle{font-size:13px;color:var(--ink-2)}
+/* Filled in from a photo and not yet looked at. Loud on purpose: a wrong total
+   here walks straight into a tax claim. */
+.photoed{background:#fff7e6;border-color:#e8d5a8;box-shadow:inset 0 0 0 1px #e8d5a8}
+/* At 380px the "getting ready" line fills the row on its own, so the bar and Skip
+   wrap underneath rather than the bar being squeezed to nothing. */
+.reading{font-size:14px;color:var(--ink-2);display:flex;flex-wrap:wrap;align-items:center;
+  gap:8px 10px;margin-top:10px}
+.reading .bar{flex:1 1 120px;min-width:110px;height:4px;background:var(--line);
+  border-radius:2px;overflow:hidden}
+.reading .bar i{display:block;height:100%;background:var(--ink);transition:width .2s}
 .flag{font-size:14px;color:#7a4d12;background:#fff7e6;border:1px solid #e8d5a8;border-radius:4px;
   padding:8px 10px;margin-top:10px}
 .thumb{display:block;width:100%;max-height:240px;object-fit:contain;background:#f2f5f6;
@@ -170,6 +180,9 @@ let receiptMode=false, noGst=false, invoiceHeld=false, gstTouched=false, pending
 /* history and claimable views */
 let spendSub=null, claimFY="all", histFilter="all", histSearch="", openHist={}, openRows={};
 let photoFY="all";                       // which year of receipt photos the export button will take
+/* reading receipts: ocrState drives the progress line, photoFilled marks the fields
+   that came off the photo and have not been checked by hand yet */
+let ocrState=null, photoFilled={}, ocrJob=0;
 let idbOK=true, photoUrls={};
 
 /* ---------- helpers ---------- */
@@ -217,6 +230,7 @@ function migrate(o){
     o.investValues=(o.investValues||[]).map(v=>Object.assign({},v,{hid:hid}));
   }
   if(typeof o.payDay!=="number") o.payDay=3;
+  if(typeof o.readReceipts!=="boolean") o.readReceipts=true;   // reading photos is on unless turned off
   delete o.receiptPhotos;                 // a note to whoever opens the backup file, not state
   /* Saves from before savings corrections existed simply have no list yet. */
   const st=Object.assign({income:[],expenses:[],recurring:[],owed:[],repayments:[],
@@ -270,8 +284,9 @@ const photoGet=id=>idbDo("readonly",st=>st.get(id));
 const photoDel=id=>idbDo("readwrite",st=>st.delete(id));
 
 /* A phone camera hands back 4MB. Down to the long edge at 1600px and quality 0.7 a
-   receipt lands nearer 200KB, still easily readable. */
-function compress(file){
+   receipt lands nearer 200KB, still easily readable. The reader asks for a bigger,
+   sharper copy than that — see readCopy() — and throws it away afterwards. */
+function compress(file,edge,quality){
   return new Promise((res,rej)=>{
     const fr=new FileReader();
     fr.onerror=()=>rej();
@@ -279,11 +294,11 @@ function compress(file){
       const img=new Image();
       img.onerror=()=>rej();
       img.onload=()=>{
-        const long=Math.max(img.width,img.height), k=long>1600?1600/long:1;
+        const max=edge||1600, long=Math.max(img.width,img.height), k=long>max?max/long:1;
         const c=document.createElement("canvas");
         c.width=Math.max(1,Math.round(img.width*k)); c.height=Math.max(1,Math.round(img.height*k));
         c.getContext("2d").drawImage(img,0,0,c.width,c.height);
-        c.toBlob(b=>b?res(b):rej(),"image/jpeg",0.7);
+        c.toBlob(b=>b?res(b):rej(),"image/jpeg",quality||0.7);
       };
       img.src=fr.result;
     };
@@ -292,6 +307,153 @@ function compress(file){
 }
 const blobToData=b=>new Promise((res,rej)=>{const r=new FileReader();
   r.onerror=()=>rej(); r.onload=()=>res(r.result); r.readAsDataURL(b)});
+/* ---------- reading the receipt ----------
+   Tesseract.js, pinned and vendored in ./vendor, is the one dependency in the app.
+   It earns the exception by keeping rule 8: the reading happens in a worker on this
+   phone, and no part of a receipt ever goes near a network. See RECEIPTS.md.
+
+   It is about ten megabytes, so nothing loads until he actually photographs a
+   receipt with the setting on, and it is never in the service worker's SHELL.
+   Everything it fills in is a suggestion he can type over. */
+const OCR_FILES={
+  lib:"vendor/tesseract.min.js", worker:"vendor/worker.min.js", lang:"vendor",
+  simd:"vendor/tesseract-core-simd-lstm.wasm.js", plain:"vendor/tesseract-core-lstm.wasm.js"
+};
+const ocrUrl=f=>new URL(f,location.href).href;   // the worker resolves from a blob: URL, so absolute
+/* The SIMD core is twice the speed and every phone since about 2021 has it. The plain
+   one is the fallback, and only ever one of the two is downloaded. */
+function hasSimd(){
+  try{ return WebAssembly.validate(new Uint8Array(
+    [0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,10,10,1,8,0,65,0,253,15,253,98,11])); }
+  catch(e){ return false; }
+}
+let ocrWorker=null, ocrLoading=null;
+function ocrLib(){
+  if(self.Tesseract) return Promise.resolve(self.Tesseract);
+  return new Promise((res,rej)=>{
+    const sc=document.createElement("script");
+    sc.src=OCR_FILES.lib; sc.onload=()=>self.Tesseract?res(self.Tesseract):rej();
+    sc.onerror=()=>rej(); document.head.appendChild(sc);
+  });
+}
+/* One worker, kept alive for the rest of the session so the second receipt in a chain
+   costs nothing. The ten megabytes land once and the browser caches them after that. */
+function ocrReady(onProgress){
+  if(ocrWorker) return Promise.resolve(ocrWorker);
+  if(ocrLoading) return ocrLoading;
+  ocrLoading=ocrLib().then(T=>T.createWorker("eng",1,{
+    workerPath:ocrUrl(OCR_FILES.worker),
+    corePath:ocrUrl(hasSimd()?OCR_FILES.simd:OCR_FILES.plain),
+    langPath:ocrUrl(OCR_FILES.lang),
+    gzip:true,
+    logger:m=>{ if(onProgress) onProgress(m); }
+  })).then(w=>{ ocrWorker=w; ocrLoading=null; return w; })
+    .catch(e=>{ ocrLoading=null; throw e; });
+  return ocrLoading;
+}
+/* The stored photo is deliberately small and soft. Reading wants a bigger, sharper
+   copy, which is used once and dropped. */
+const readCopy=file=>compress(file,2000,0.92);
+
+/* ---------- making sense of what came back ---------- */
+/* A tired printer and a crumpled docket turn "31.90" into "31...90" or "31 , 90",
+   so allow a smeared separator rather than lose the total over it. */
+const MONEY=/(?:\$\s*)?(\d{1,3}(?:,\d{3})+|\d+)\s*[.,]{1,3}\s*(\d{2})(?!\d)/g;
+function moneyIn(line){
+  const out=[]; let m; MONEY.lastIndex=0;
+  while((m=MONEY.exec(line))) out.push(parseFloat(m[1].replace(/,/g,"")+"."+m[2]));
+  return out;
+}
+/* Lines that carry a number which is never the total. */
+const NOT_TOTAL=/\bCHANGE\b|TENDER|ROUND|\bCASH\s*OUT\b/;
+const MONTHS={JAN:1,FEB:2,MAR:3,APR:4,MAY:5,JUN:6,JUL:7,AUG:8,SEP:9,OCT:10,NOV:11,DEC:12};
+
+const TOTAL_WORD=/\bTOTAL\b|\bAMOUNT\s+DUE\b|\bBALANCE\s+DUE\b/;
+const GST_WORD=/\bGST\b|\bTAX\b/;
+const INCL_GST=/(INCL|INC|INCLUDING)\s*\.?\s*(OF\s*)?GST/;
+function readTotal(lines){
+  let best=null;
+  const keep=(v,rank)=>{ if(v>0&&(!best||rank>best.rank||(rank===best.rank&&v>best.v))) best={v,rank}; };
+  lines.forEach((line,i)=>{
+    const U=line.toUpperCase();
+    if(NOT_TOTAL.test(U)) return;
+    let vals=moneyIn(line);
+    /* A total keyword whose figure didn't come through the camera: the figure is
+       sometimes on the next line. Only take it when that line is a bare number —
+       otherwise a smudged "TOTAL" quietly adopts the GST line underneath it. */
+    const next=lines[i+1]||"";
+    if(!vals.length&&TOTAL_WORD.test(U)&&!/[A-Za-z]/.test(next)) vals=moneyIn(next);
+    if(!vals.length) return;
+    const sub=/\bSUB\s*-?\s*TOTAL\b/.test(U);
+    const tot=TOTAL_WORD.test(U);
+    /* A figure sitting on a GST line is the GST, not the total — "TOTAL GST 4.09" very
+       much included. "TOTAL INCL GST 45.00" is the one real exception. */
+    if(GST_WORD.test(U)&&!INCL_GST.test(U)) return;
+    /* Within a rank the biggest figure wins, which is the one that is really the total. */
+    if(tot&&!sub) vals.forEach(v=>keep(v,3));
+    else if(sub) vals.forEach(v=>keep(v,2));
+    else vals.forEach(v=>keep(v,1));          // nothing labelled: the largest figure, usually right
+  });
+  return best?best.v:null;
+}
+/* An explicit GST line beats dividing by eleven: a docket with fresh food on it carries
+   less GST than an eleventh, and claiming the eleventh would be overclaiming. */
+function readGst(lines,total){
+  for(const line of lines){
+    const U=line.toUpperCase();
+    if(!/\bGST\b|\bTAX\b/.test(U)) continue;
+    if(/GST\s*FREE|NO\s*GST|GST\s*EXEMPT|TAX\s*INVOICE/.test(U)) continue;
+    const v=moneyIn(line).filter(n=>n>0&&(!total||n<=total*0.2));   // a fifth is well past an eleventh
+    if(v.length) return Math.max.apply(null,v);
+  }
+  return null;
+}
+function buildDate(d,mo,y){
+  y=+y; if(y<100) y+=2000;
+  if(!(d>=1&&d<=31&&mo>=1&&mo<=12&&y>=2000&&y<=2100)) return null;
+  const iso=y+"-"+String(mo).padStart(2,"0")+"-"+String(d).padStart(2,"0");
+  const back=new Date(iso+"T00:00:00");
+  return isoLocal(back)===iso?iso:null;                 // 31 February and friends
+}
+/* Australian receipts are day first. Anything in the future, or more than two years
+   old, is a misread rather than a date. */
+const datePlausible=iso=>iso<=today()&&iso>=addDays(today(),-730);
+function readDate(text){
+  const cands=[]; let m;
+  const slash=/(\d{1,2})\s*[\/\-.]\s*(\d{1,2})\s*[\/\-.]\s*(\d{2,4})/g;
+  while((m=slash.exec(text))) cands.push([+m[1],+m[2],m[3]]);
+  const named=/(\d{1,2})\s*[-\s]\s*([A-Za-z]{3})[A-Za-z]*\.?\s*[-,\s]\s*(\d{2,4})/g;
+  while((m=named.exec(text))){ const mo=MONTHS[m[2].toUpperCase()]; if(mo) cands.push([+m[1],mo,m[3]]); }
+  for(const c of cands){
+    const dayFirst=buildDate(c[0],c[1],c[2]);
+    if(dayFirst&&datePlausible(dayFirst)) return dayFirst;
+    const monthFirst=buildDate(c[1],c[0],c[2]);         // only when day first didn't work out
+    if(monthFirst&&datePlausible(monthFirst)) return monthFirst;
+  }
+  return null;
+}
+/* The shop name is usually in the first line or two. Optional, so don't try hard. */
+function readSupplier(lines){
+  for(const line of lines.slice(0,3)){
+    const t=line.replace(/\s+/g," ").trim();
+    if(t.length<3||t.length>40) continue;
+    if(/\bABN\b|\bACN\b|TAX\s*INVOICE|\bRECEIPT\b|\bPH\b|PHONE|\bTEL\b/i.test(t)) continue;
+    if((t.match(/[A-Za-z]/g)||[]).length<3) continue;
+    if(/^\d/.test(t)) continue;                          // a street number, not a name
+    return t;
+  }
+  return null;
+}
+function parseReceipt(text){
+  const lines=String(text||"").split(/\r?\n/).map(l=>l.trim()).filter(l=>l);
+  const amount=readTotal(lines);
+  const date=readDate(lines.join("\n"));
+  /* A shop name on its own doesn't make it a receipt. Without a total or a date this
+     was a photo of something else, and filling in a guess would be worse than nothing. */
+  if(amount==null&&!date) return {amount:null,gst:null,date:null,supplier:null};
+  return {amount, gst:readGst(lines,amount), date, supplier:readSupplier(lines)};
+}
+
 function dataToBlob(u){
   const c=u.indexOf(","), head=u.slice(0,c), bin=atob(u.slice(c+1));
   const type=(/:(.*?);/.exec(head)||[,"image/jpeg"])[1];
@@ -629,6 +791,7 @@ function receiptBlock(){
     <button class="btn ghost" data-act="pick-photo">Choose a photo</button>
     <input type="file" id="rc-pick" accept="image/*" multiple style="display:none">
     <div id="rc-prev"></div>
+    <div id="rc-read"></div>
     <p class="note">GST is worked out as a rounded eleventh of the total, which is how it works here. Change it if
       the receipt says something different, or say there's none \u2014 fresh food and most medical aren't taxed.</p>
   </div>`;
@@ -675,6 +838,8 @@ function viewClaim(){
           ${open?`<div class="hdet">
             <div class="subtle">${esc(catOf(e.cat).name)} &middot; ${e.noGst?"no GST on this one":"GST "+money(e.gst||0,true)}
               &middot; ${e.amount>NEEDS_INVOICE?(e.invoiceHeld?"tax invoice held":"needs a proper tax invoice"):"under "+money(NEEDS_INVOICE,true)+", a receipt is enough"}</div>
+            ${e.readFields&&e.readFields.length?`<div class="flag">Read off the photo and never checked:
+              ${e.readFields.map(esc).join(", ")}. Worth a look against the picture below.</div>`:""}
             ${e.photo?`<img class="thumb" data-photo="${e.id}" alt="Photo of the receipt from ${esc(e.supplier||e.what)}">`:""}
             <div style="display:flex;gap:8px;margin-top:10px">
               <button class="mini${e.invoiceHeld?" solid":""}" data-act="held-toggle" data-id="${e.id}">${
@@ -928,6 +1093,18 @@ function viewSetup(){
     <button class="btn" data-act="save-settings">Save changes</button>
   </div>
   <div class="card">
+    <h2>Reading receipts</h2>
+    <p class="sub">Fill in the total and the date from the photo, so you don't have to type them.
+      Whatever it reads is marked for checking and you can type over any of it.</p>
+    <div class="chips">
+      <button class="chip" data-act="read-toggle" aria-pressed="${!!S.readReceipts}">${
+        S.readReceipts?"On":"Off"}</button>
+    </div>
+    <p class="note">The reader is about ten megabytes and downloads once, the first time you use it.
+      It runs on this phone \u2014 no receipt of yours goes anywhere. Turned off, nothing downloads at all
+      and the form opens straight away.</p>
+  </div>
+  <div class="card">
     <h2>Keeping your data safe</h2>
     <p class="sub">Everything lives on this device only. Back it up now and then, and always before changing phones.</p>
     <button class="btn ghost" data-act="backup">Download a backup file</button>
@@ -997,6 +1174,83 @@ function resetReceipt(){
 function dropPhotos(){
   pendingPhotos.forEach(p=>{ if(p.url) URL.revokeObjectURL(p.url); });
   pendingPhotos=[];
+  ocrJob++; ocrState=null; clearMarks();          // abandon any read still running
+}
+/* Reading runs on the photo at the head of the queue, one at a time, so a chain of
+   four gallery photos reads the one he is filling in rather than all four at once. */
+function maybeRead(){
+  if(!S||!S.readReceipts) return;
+  const head=pendingPhotos[0];
+  if(!head||!head.file||head.readDone||head.reading) return;
+  runRead(head);
+}
+function runRead(entry){
+  entry.reading=true;
+  const job=++ocrJob, stale=()=>job!==ocrJob;
+  const give=msg=>{ entry.reading=false; entry.readDone=true;
+    if(!stale()){ ocrState={stage:"note",msg}; showRead(); } };
+  ocrState={stage:"ready",pct:0}; showRead();
+  ocrReady(m=>{
+    if(stale()) return;
+    ocrState=(m&&m.status==="recognizing text")?{stage:"reading",pct:m.progress||0}
+                                              :{stage:"ready",pct:(m&&m.progress)||0};
+    showRead();
+  }).then(w=>{
+    if(stale()) return null;
+    ocrState={stage:"reading",pct:0}; showRead();
+    return readCopy(entry.file).then(b=>w.recognize(b));
+  }).then(r=>{
+    if(stale()||!r) return;
+    entry.reading=false; entry.readDone=true;
+    const conf=r.data&&typeof r.data.confidence==="number"?r.data.confidence:100;
+    applyRead(conf<50?{}:parseReceipt(r.data&&r.data.text));   // too garbled to believe
+  /* The ten megabytes only have to come down once, and after that the phone has them,
+     so don't refuse offline — try, and only say so if it actually couldn't load. */
+  }).catch(()=>give(navigator.onLine
+    ? "Couldn't get the receipt reader going. Type the figures in \u2014 the photo is saved either way."
+    : "You're offline and the reader hasn't downloaded yet. Type the figures in \u2014 it'll be ready next time you're on wifi."));
+}
+/* Nothing is filled in silently. Every field that came off the photo is marked until
+   he edits it or says it looks right, because a wrong total walks into a tax claim. */
+function applyRead(r){
+  let any=false;
+  const set=(id,v)=>{ const el=document.getElementById(id); if(!el||v==null) return;
+    el.value=v; el.classList.add("photoed"); photoFilled[id]=true; any=true; };
+  if(r.amount!=null) set("s-amt",r.amount.toFixed(2));
+  if(r.date) set("s-date",r.date);
+  updateGst();                                    // the eleventh, off the total it just read
+  if(r.gst!=null){ set("s-gst",r.gst.toFixed(2)); gstTouched=true; }
+  if(r.supplier) set("s-sup",r.supplier);
+  ocrState=any?{stage:"filled"}
+    :{stage:"note",msg:"Couldn't read anything off that one. Type it in \u2014 the photo is saved either way."};
+  showRead();
+}
+function unmark(id){
+  const el=document.getElementById(id); if(el) el.classList.remove("photoed");
+  delete photoFilled[id];
+  if(!Object.keys(photoFilled).length&&ocrState&&ocrState.stage==="filled"){ ocrState=null; showRead(); }
+}
+function clearMarks(){
+  Object.keys(photoFilled).forEach(id=>{ const el=document.getElementById(id);
+    if(el) el.classList.remove("photoed"); });
+  photoFilled={};
+}
+const READ_NAMES={"s-amt":"the total","s-date":"the date","s-gst":"the GST","s-sup":"the supplier"};
+function showRead(){
+  const box=document.getElementById("rc-read"); if(!box) return;
+  const st=ocrState;
+  if(!st){ box.innerHTML=""; return; }
+  if(st.stage==="ready"||st.stage==="reading"){
+    box.innerHTML=`<div class="reading"><span>${st.stage==="ready"
+        ? "Getting the receipt reader ready, this happens once\u2026"
+        : "Reading the receipt\u2026"}</span>
+      <span class="bar"><i style="width:${Math.round((st.pct||0)*100)}%"></i></span>
+      <button class="link" data-act="ocr-skip">Skip</button></div>`;
+  }else if(st.stage==="filled"){
+    box.innerHTML=`<div class="flag">Filled in from the photo: ${
+      Object.keys(photoFilled).map(id=>READ_NAMES[id]||id).join(", ")}. Check it against the docket before you save.</div>
+      <button class="link" data-act="ocr-checked">Checked, it's right</button>`;
+  }else box.innerHTML=`<p class="note">${esc(st.msg||"")}</p>`;
 }
 function showPhoto(){
   const box=document.getElementById("rc-prev"); if(!box) return;
@@ -1016,12 +1270,15 @@ function wire(){
   updateSplit();
 
   const sa=document.getElementById("s-amt"), sg=document.getElementById("s-gst");
-  if(sa) sa.addEventListener("input",updateGst);
-  if(sg) sg.addEventListener("input",()=>{ gstTouched=true; });
-  showPhoto(); updateGst();
+  if(sa) sa.addEventListener("input",()=>{ unmark("s-amt"); updateGst(); });
+  if(sg) sg.addEventListener("input",()=>{ gstTouched=true; unmark("s-gst"); });
+  const sd=document.getElementById("s-date"), su=document.getElementById("s-sup");
+  if(sd) sd.addEventListener("input",()=>unmark("s-date"));
+  if(su) su.addEventListener("input",()=>unmark("s-sup"));
+  showPhoto(); showRead(); updateGst();
 
   /* The camera hands back one photo, the gallery can hand back several. Both land in the
-     same queue, one at a time \u2014 decoding a phoneful of 4MB images at once runs a phone
+     same queue, one at a time — decoding a phoneful of 4MB images at once runs a phone
      out of memory, and the preview fills in as each one is done. */
   const takePhotos=e=>{
     const files=Array.prototype.slice.call(e.target.files||[]); e.target.value="";
@@ -1029,7 +1286,7 @@ function wire(){
     toast(files.length===1?"Shrinking the photo\u2026":"Shrinking "+files.length+" photos\u2026");
     let bad=0;
     files.reduce((p,f)=>p.then(()=>compress(f)
-      .then(b=>{ pendingPhotos.push({blob:b,url:URL.createObjectURL(b)}); showPhoto(); })
+      .then(b=>{ pendingPhotos.push({blob:b,url:URL.createObjectURL(b),file:f}); showPhoto(); maybeRead(); })
       .catch(()=>{ bad++; })), Promise.resolve())
       .then(()=>{ if(bad) toast(bad===files.length?"Couldn't read that photo"
         :"Couldn't read "+bad+" of those photos"); });
@@ -1100,7 +1357,7 @@ document.getElementById("app").addEventListener("click",e=>{
   if(act==="start"){
     const sav=num(val("u-sav")), wal=num(val("u-wal"));
     S={goal:num(val("u-goal")), deadline:val("u-date"), payDay:parseInt(val("u-payday"),10)||0,
-       categories:DEFAULT_CATS, holdings:readHoldLines("#setup-holds"),
+       readReceipts:true, categories:DEFAULT_CATS, holdings:readHoldLines("#setup-holds"),
        income:[], expenses:[], recurring:[], owed:[], repayments:[], investValues:[], adjustments:[]};
     if(sav||wal) S.income.push({id:uid(), date:today(), amount:sav+wal, toSavings:sav, invest:{}, opening:true});
     save(); tab = S.holdings.length ? "goal" : "pay"; render();
@@ -1173,10 +1430,17 @@ document.getElementById("app").addEventListener("click",e=>{
   }
   if(act==="snap"){ const f=document.getElementById("rc-file"); if(f) f.click(); return; }
   if(act==="pick-photo"){ const f=document.getElementById("rc-pick"); if(f) f.click(); return; }
+  if(act==="ocr-skip"){
+    ocrJob++;                                     // anything still running is now ignored
+    const h=pendingPhotos[0]; if(h){ h.reading=false; h.readDone=true; }
+    ocrState=null; showRead(); return;
+  }
+  if(act==="ocr-checked"){ clearMarks(); ocrState=null; showRead(); return; }
   if(act==="unsnap"){
     const p=pendingPhotos.shift();
     if(p&&p.url) URL.revokeObjectURL(p.url);
-    showPhoto(); return;
+    ocrJob++; ocrState=null; clearMarks();
+    showPhoto(); showRead(); maybeRead(); return;
   }
 
   if(act==="pick-cat"||act==="pick-rcat"){
@@ -1195,15 +1459,20 @@ document.getElementById("app").addEventListener("click",e=>{
       e2.noGst=noGst;
       e2.gst=noGst?0:Math.round(num(val("s-gst"))*100)/100;
       e2.invoiceHeld=invoiceHeld;
+      /* Which figures came off the photo and were never looked at. The claimable list
+         shows these, so an unchecked total can be found again later. */
+      const left=Object.keys(photoFilled).map(id=>READ_NAMES[id]).filter(Boolean);
+      if(left.length) e2.readFields=left;
     }
     const shot=receiptMode&&pendingPhotos.length?pendingPhotos.shift():null;
     const done=m=>{
       if(shot&&shot.url) URL.revokeObjectURL(shot.url);
       /* Photos still queued each want their own figures, so the form stays open for the next one. */
       const left=receiptMode?pendingPhotos.length:0;
-      if(left){ noGst=false; invoiceHeld=false; gstTouched=false; }
+      if(left){ noGst=false; invoiceHeld=false; gstTouched=false; ocrState=null; photoFilled={}; }
       else resetReceipt();
       save(); render();
+      if(left) maybeRead();                       // the next photo's turn has come up
       toast(left?m+" \u2014 "+left+" photo"+(left>1?"s":"")+" to go":m);
     };
     S.expenses.push(e2);
@@ -1354,6 +1623,10 @@ document.getElementById("app").addEventListener("click",e=>{
         {receiptPhotos:"not in this file - use Download your receipt photos for those"}),null,2));
     if(S){ S.lastBackup=today(); save(); render(); }
     toast(photoCount()?"Figures saved. Photos are a separate file.":"Backup downloaded"); return; }
+  if(act==="read-toggle"){
+    S.readReceipts=!S.readReceipts; save(); render();
+    toast(S.readReceipts?"Receipts will be read from the photo":"Reading turned off, nothing will download");
+    return; }
   if(act==="photo-fy"){ photoFY=btn.dataset.id; render(); return; }
   if(act==="backup-photos"){
     const fy=photoFY, withPhoto=photosIn(fy);

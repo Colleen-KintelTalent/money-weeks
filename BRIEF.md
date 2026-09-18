@@ -1,8 +1,10 @@
 # Money Weeks — handoff brief
 
 A weekly savings, spending and investment tracker for one person. Single page, no
-backend, no accounts, no build step, no dependencies. State lives in `localStorage`
-on the user's own device, with receipt photos in IndexedDB beside it.
+backend, no accounts, no build step. One dependency, vendored: the receipt reader in
+`vendor/` — see `RECEIPTS.md` for why that exception was made and `vendor/README.md`
+for what is pinned. State lives in `localStorage` on the user's own device, with
+receipt photos in IndexedDB beside it.
 
 Built for one person on an Android phone, paid on a fixed weekday, holding several
 investments that they move money between often. The target is a savings goal by a
@@ -100,7 +102,9 @@ the expense still saves without one if IndexedDB is blocked.
 which point it lands in savings via a `repayments` entry.
 
 **8. Nothing leaves the device.** No analytics, no network calls, no CDN beyond the
-Google Fonts import, which degrades to a system font offline. `probeStorage()` runs
+Google Fonts import, which degrades to a system font offline. The receipt reader is
+vendored rather than loaded from a CDN for exactly this reason: it reads the photo in a
+worker on the phone, and no receipt is ever uploaded anywhere. `probeStorage()` runs
 at boot and shows a banner if storage is blocked rather than losing data quietly.
 Backup and restore are JSON file download and upload.
 
@@ -129,7 +133,9 @@ payday are already subtracted, so "left to spend" is money that's genuinely avai
 
 An expense is `{ id, date, amount, what, cat }` plus, when it came off a bill, `bill: true`,
 and when it's a work receipt: `supplier`, `gst`, `noGst`, `claimable`, `invoiceHeld`, and
-`photo: true` if a picture of it is in IndexedDB under the same id.
+`photo: true` if a picture of it is in IndexedDB under the same id. `readFields` lists any
+figures that were read off the photo and never checked by hand, which is what the warning
+in the claimable list is driven by. `readReceipts` on the state turns the reader off.
 
 `KEY` is `moneyweeks:v4`; `load()` migrates a `v3` save by folding its single lump of
 investments into one holding. Bump `KEY` only alongside a migration, or existing
@@ -165,7 +171,8 @@ Don't swap it for a bare `setMonth()`.
 |---|---|
 | `index.html` | The whole app. HTML, CSS and JS in one file, on purpose. |
 | `manifest.webmanifest` | Makes it installable to the home screen. |
-| `sw.js` | Service worker, cache-first, so it opens with no signal. |
+| `sw.js` | Service worker, cache-first, so it opens with no signal. `vendor/` is kept out of `SHELL` and cached only once it is actually used. |
+| `vendor/` | The pinned receipt reader, about 10MB. Downloads on first use, never at install. |
 | backup `.json` | Every figure, no photos. Says so in the file. |
 | receipts `.json` | Photos only, base64, much larger. Restore takes either. |
 | `icon-*.png` | App icons. |
@@ -215,13 +222,17 @@ No test harness. These are the cases that have actually broken:
     backwards through the calendar. Check `addMonths("2026-01-31", 1)` is
     `2026-02-28` and not the 27th.
 
+## Reading receipts
+
+Built, and set out in full in `RECEIPTS.md` — read that before touching it. In short:
+Tesseract.js runs in a worker on the phone, on a sharper copy of the photo taken before
+`compress()` shrinks it for storage. It fills in the total, the date, the GST and the
+supplier, marks every field it filled so an unchecked figure can't quietly become a tax
+claim, and says so plainly when it can't read something rather than guessing. An explicit
+GST line on the docket always beats dividing by eleven. There is an off switch in Setup.
+
 ## Worth building next
 
-- Reading a receipt automatically. The seam is `compress()` — it hands back a JPEG blob,
-  which is what any OCR step would want. Left unbuilt on purpose: a cloud vision API means
-  his receipts leave the phone and an API key sits in a public repo, and an in-browser
-  library is megabytes of download that struggles with crumpled thermal paper, all to save
-  about fifteen seconds of typing.
 - Import from CSV, to bring in existing spreadsheet history.
 - Per-category weekly budget targets, shown against actuals.
 - A "what if" line: the weekly rate needed if the deadline moves.
