@@ -1,8 +1,8 @@
 # Vendored, on purpose
 
 Tesseract.js, pinned and kept in the repo rather than loaded from a CDN, so that
-receipt photos are read on the phone and nothing leaves the device. See
-`RECEIPTS.md` for why this is the one dependency.
+receipt photos are read on the phone and nothing leaves the device. See **Reading
+receipts** in `BRIEF.md` for why this is the one dependency.
 
 | File | From | Version |
 |---|---|---|

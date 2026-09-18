@@ -2,9 +2,9 @@
 
 A weekly savings, spending and investment tracker for one person. Single page, no
 backend, no accounts, no build step. One dependency, vendored: the receipt reader in
-`vendor/` — see `RECEIPTS.md` for why that exception was made and `vendor/README.md`
-for what is pinned. State lives in `localStorage` on the user's own device, with
-receipt photos in IndexedDB beside it.
+`vendor/` — see **Reading receipts** below for why that exception was made, and
+`vendor/README.md` for what is pinned. State lives in `localStorage` on the user's own
+device, with receipt photos in IndexedDB beside it.
 
 Built for one person on an Android phone, paid on a fixed weekday, holding several
 investments that they move money between often. The target is a savings goal by a
@@ -228,7 +228,7 @@ No test harness. These are the cases that have actually broken:
 
 ## Not losing it all
 
-Everything is on one phone, so three things guard against that, set out in `BACKUP.md`:
+Everything is on one phone, so three things guard against that:
 
 `navigator.storage.persist()` is requested once after setup (and once for existing saves,
 the first time Setup is opened), so the browser won't evict the data when the phone fills
@@ -252,7 +252,6 @@ years are safe.
 
 ## Reading receipts
 
-Built, and set out in full in `RECEIPTS.md` — read that before touching it. In short:
 Tesseract.js runs in a worker on the phone, on a sharper copy of the photo taken before
 `compress()` shrinks it for storage. It fills in the total, the date, the GST and the
 supplier, marks every field it filled so an unchecked figure can't quietly become a tax

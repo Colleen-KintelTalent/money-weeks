@@ -342,7 +342,7 @@ const blobToData=b=>new Promise((res,rej)=>{const r=new FileReader();
 /* ---------- reading the receipt ----------
    Tesseract.js, pinned and vendored in ./vendor, is the one dependency in the app.
    It earns the exception by keeping rule 8: the reading happens in a worker on this
-   phone, and no part of a receipt ever goes near a network. See RECEIPTS.md.
+   phone, and no part of a receipt ever goes near a network. See BRIEF.md.
 
    It is about ten megabytes, so nothing loads until he actually photographs a
    receipt with the setting on, and it is never in the service worker's SHELL.
