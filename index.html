@@ -169,6 +169,7 @@ let S=null, tab="pay", filter=null, confirmWipe=false, showRegulars=false,
 let receiptMode=false, noGst=false, invoiceHeld=false, gstTouched=false, pendingPhotos=[];
 /* history and claimable views */
 let spendSub=null, claimFY="all", histFilter="all", histSearch="", openHist={}, openRows={};
+let photoFY="all";                       // which year of receipt photos the export button will take
 let idbOK=true, photoUrls={};
 
 /* ---------- helpers ---------- */
@@ -902,6 +903,8 @@ function histRow(e){
 
 /* ---------- setup ---------- */
 function viewSetup(){
+  const pYears=photoYears();
+  if(photoFY!=="all"&&pYears.indexOf(+photoFY)<0) photoFY="all";
   return `<div class="card">
     <div class="row"><label for="g-goal">Goal</label>
       <div class="money"><span>$</span><input id="g-goal" class="in" inputmode="decimal" value="${S.goal}"></div></div>
@@ -928,12 +931,19 @@ function viewSetup(){
     <h2>Keeping your data safe</h2>
     <p class="sub">Everything lives on this device only. Back it up now and then, and always before changing phones.</p>
     <button class="btn ghost" data-act="backup">Download a backup file</button>
-    <button class="btn ghost" data-act="backup-photos">Download your receipt photos${
-      photoCount()?" ("+photoCount()+")":""}</button>
+    ${pYears.length>1?`<div class="chips" style="margin-top:12px">
+      <button class="chip" data-act="photo-fy" data-id="all" aria-pressed="${photoFY==="all"}">All time (${photoCount()})</button>
+      ${pYears.map(f=>`<button class="chip" data-act="photo-fy" data-id="${f}" aria-pressed="${photoFY===String(f)}">${fyLabel(f)} (${photoCount(f)})</button>`).join("")}
+    </div>`:""}
+    <button class="btn ghost" data-act="backup-photos">${photoFY==="all"
+      ? "Download your receipt photos"+(photoCount()?" ("+photoCount()+")":"")
+      : "Download "+fyLabel(+photoFY)+" receipt photos ("+photoCount(photoFY)+")"}</button>
     <button class="btn ghost" data-act="restore">Restore from a backup file</button>
     <p class="note"><strong>The backup file holds every figure but no receipt photos.</strong> Photos are pictures,
       not numbers, so they come in their own much larger file. Take both if you want the lot. Restoring accepts
-      either file and tells you which one it just put back.</p>
+      either file and tells you which one it just put back.${pYears.length>1?` Photos can come a financial year
+      at a time, which keeps each file small enough for a phone to build and a computer to open. Take every year
+      if you want the lot.`:""}</p>
     <input type="file" id="restore-file" accept="application/json,.json" style="display:none">
     ${ !confirmWipe?`<button class="btn danger" data-act="ask-wipe">Start over</button>`
       :`<p class="note">This deletes everything. It can't be undone.</p>
@@ -1064,7 +1074,11 @@ function wire(){
   });
 }
 
-const photoCount=()=>S?S.expenses.filter(e=>e.photo).length:0;
+const photosIn=fy=>S?S.expenses.filter(e=>e.photo&&(fy==="all"||fyOf(e.date)===+fy)):[];
+const photoCount=fy=>photosIn(fy===undefined?"all":fy).length;
+/* Which financial years actually hold photos, newest first. */
+const photoYears=()=>{ const y=[]; photosIn("all").forEach(e=>{ const f=fyOf(e.date);
+  if(y.indexOf(f)<0) y.push(f); }); return y.sort().reverse(); };
 
 function readHoldLines(sel){
   return Array.prototype.map.call(document.querySelectorAll(sel+" .line"),el=>({
@@ -1340,9 +1354,10 @@ document.getElementById("app").addEventListener("click",e=>{
         {receiptPhotos:"not in this file - use Download your receipt photos for those"}),null,2));
     if(S){ S.lastBackup=today(); save(); render(); }
     toast(photoCount()?"Figures saved. Photos are a separate file.":"Backup downloaded"); return; }
+  if(act==="photo-fy"){ photoFY=btn.dataset.id; render(); return; }
   if(act==="backup-photos"){
-    const withPhoto=S.expenses.filter(e=>e.photo);
-    if(!withPhoto.length){ toast("No receipt photos yet"); return; }
+    const fy=photoFY, withPhoto=photosIn(fy);
+    if(!withPhoto.length){ toast(fy==="all"?"No receipt photos yet":"No receipt photos in that year"); return; }
     toast("Gathering "+withPhoto.length+" photos\u2026");
     Promise.all(withPhoto.map(e=>photoGet(e.id).then(b=>b?blobToData(b).then(u=>[e.id,u]):null)
       .catch(()=>null)))
@@ -1350,9 +1365,10 @@ document.getElementById("app").addEventListener("click",e=>{
         const photos={}; pairs.forEach(x=>{ if(x) photos[x[0]]=x[1]; });
         const n=Object.keys(photos).length;
         if(!n){ toast("Couldn't read the photos back"); return; }
-        download("money-weeks-receipts-"+today()+".json",
-          JSON.stringify({type:"money-weeks-receipts",saved:today(),photos}));
-        toast(n+" receipt photos downloaded");
+        download("money-weeks-receipts-"+(fy==="all"?"all":fyLabel(+fy))+"-"+today()+".json",
+          JSON.stringify({type:"money-weeks-receipts",saved:today(),
+            fy:fy==="all"?"all":fyLabel(+fy),photos}));
+        toast(n+" receipt photos downloaded"+(fy==="all"?"":", "+fyLabel(+fy)));
       }).catch(()=>toast("Couldn't read the photos back"));
     return; }
   if(act==="restore"){ document.getElementById("restore-file").click(); return; }
