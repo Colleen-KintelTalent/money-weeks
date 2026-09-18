@@ -183,6 +183,9 @@ let photoFY="all";                       // which year of receipt photos the exp
 /* reading receipts: ocrState drives the progress line, photoFilled marks the fields
    that came off the photo and have not been checked by hand yet */
 let ocrState=null, photoFilled={}, ocrJob=0;
+/* hushed for this session only — the reminder is a card he can scroll past,
+   never a thing that has to be dealt with before he can use the app */
+let nudgeHushed=false, shareOK=false;
 let idbOK=true, photoUrls={};
 
 /* ---------- helpers ---------- */
@@ -214,6 +217,31 @@ const weekEnd=i=>{ const endDay=(payDay()+6)%7; const d=new Date(i+"T00:00:00");
 const lastPayday=()=>{ const d=new Date(today()+"T00:00:00");
   d.setDate(d.getDate()-((d.getDay()-payDay()+7)%7)); return isoLocal(d); };
 
+/* Real detection, not a guess from the platform: Safari on iPhone shares files and
+   Chrome on iPhone does not, and no user agent string tells you that reliably. */
+function probeShare(){
+  try{
+    const f=new File(["{}"],"probe.json",{type:"application/json"});
+    shareOK=!!(navigator.share&&navigator.canShare&&navigator.canShare({files:[f]}));
+  }catch(e){ shareOK=false; }
+}
+/* Ask the browser to treat this data as worth keeping, so it isn't evicted when the
+   phone fills up. Asked once after setup, never on first paint, and the answer is
+   reported honestly in Setup rather than dressed up. */
+function checkPersist(ask){
+  if(!S) return;
+  if(!navigator.storage||!navigator.storage.persisted){
+    if(S.persisted!==null){ S.persisted=null; save(); }
+    return;
+  }
+  navigator.storage.persisted().then(has=>{
+    if(has) return true;
+    if(!ask) return false;
+    return navigator.storage.persist();
+  }).then(got=>{
+    if(S&&S.persisted!==got){ S.persisted=got; save(); render(); }
+  }).catch(()=>{});
+}
 function probeStorage(){
   try{ localStorage.setItem("__p","1"); storageOK=localStorage.getItem("__p")==="1"; localStorage.removeItem("__p"); }
   catch(e){ storageOK=false; }
@@ -231,6 +259,10 @@ function migrate(o){
   }
   if(typeof o.payDay!=="number") o.payDay=3;
   if(typeof o.readReceipts!=="boolean") o.readReceipts=true;   // reading photos is on unless turned off
+  /* Backup bookkeeping. Counting entries at the moment of a backup is what lets the
+     reminder say what is actually at stake rather than "it has been a while". */
+  if(typeof o.lastBackupN!=="number") o.lastBackupN=o.lastBackup?entriesIn(o):0;
+  if(typeof o.lastPhotoBackupN!=="number") o.lastPhotoBackupN=0;
   delete o.receiptPhotos;                 // a note to whoever opens the backup file, not state
   /* Saves from before savings corrections existed simply have no list yet. */
   const st=Object.assign({income:[],expenses:[],recurring:[],owed:[],repayments:[],
@@ -539,14 +571,92 @@ function warnBanner(){
     <p class="sub" style="margin-bottom:0">Nothing you type will survive closing the tab. Try Samsung Internet
       instead of Chrome, or turn off private browsing.</p></div>`;
 }
+/* Everything he has typed in, which is what a lost phone would cost him. */
+function entriesIn(o){
+  if(!o) return 0;
+  return ["income","expenses","recurring","owed","repayments","adjustments","investValues"]
+    .reduce((n,k)=>n+((o[k]||[]).length),0);
+}
+const entryCount=()=>entriesIn(S);
+const newEntries=()=>Math.max(0,entryCount()-(S.lastBackupN||0));
+const newPhotos=()=>Math.max(0,photoCount()-(S.lastPhotoBackupN||0));
+const daysSince=i=>i?Math.round((new Date(today()+"T00:00:00")-new Date(i+"T00:00:00"))/864e5):null;
+const plural=(n,one,many)=>n+" "+(n===1?one:many||one+"s");
+const ago=d=>d===null?"":d===0?", taken today":d===1?", taken yesterday":", "+plural(d,"day")+" ago";
+const FIGURES_DUE=14, PHOTOS_DUE=90;                 // photos are big; a quarter is plenty
+
+/* Says what is at stake rather than that time has passed, because "it has been a
+   while" is easy to scroll past and "nineteen entries" is not. Still only a card. */
 function backupNudge(){
-  if(!storageOK||!S||S.income.length<2) return "";
-  const d=S.lastBackup?Math.round((new Date(today()+"T00:00:00")-new Date(S.lastBackup+"T00:00:00"))/864e5):null;
-  if(d!==null&&d<30) return "";
-  return `<div class="card"><h2>Time for a backup</h2><p class="sub" style="margin-bottom:0">${
-    d===null?"You haven't backed up yet. If this phone dies, everything here goes with it."
-            :"It's been "+d+" days since your last backup."}</p>
-    <button class="btn ghost" data-act="backup">Download a backup file</button></div>`;
+  if(!storageOK||!S||S.income.length<2||nudgeHushed) return "";
+  const dFig=daysSince(S.lastBackup), dPho=daysSince(S.lastPhotoBackup);
+  const nFig=newEntries(), nPho=newPhotos();
+  const figDue=nFig>0&&(dFig===null||dFig>=FIGURES_DUE);
+  const phoDue=nPho>0&&(dPho===null||dPho>=PHOTOS_DUE);
+  if(!figDue&&!phoDue) return "";
+  /* Never backed up, with a real history behind him, is the genuinely exposed case. */
+  const first=S.income.map(i=>i.date).sort()[0];
+  const never=S.lastBackup==null&&daysSince(first)>7;
+  const bits=[];
+  if(nFig) bits.push(plural(nFig,"entry","entries"));
+  if(nPho) bits.push(plural(nPho,"receipt photo"));
+  return `<div class="card"${never?' style="border-color:#c98f7a"':""}>
+    <h2>${never?"Nothing here has ever been backed up":"Worth taking a backup"}</h2>
+    <p class="sub">${never
+      ? bits.join(" and ")+" live on this phone and nowhere else. If it's lost, wiped or replaced, they go with it."
+      : bits.join(" and ")+" since your last "+(figDue?"backup":"photo backup")+ago(figDue?dFig:dPho)+"."}</p>
+    ${phoDue&&nFig?`<p class="note" style="margin-top:0">The figures file is small and worth taking often.
+      The photos are much bigger — once a quarter, or after a run of claimable spending, is plenty.</p>`:""}
+    ${shareOK?`<button class="btn" data-act="share-backup">Send a copy off this phone</button>`:""}
+    <button class="btn ghost" data-act="backup">Download a backup file</button>
+    ${phoDue?`<button class="btn ghost" data-act="${shareOK?"share-photos":"backup-photos"}">${
+      shareOK?"Send your receipt photos off this phone":"Download your receipt photos"} (${nPho} new)</button>`:""}
+    <button class="link" data-act="hush-nudge">Not now</button>
+  </div>`;
+}
+/* One place that knows what a figures backup is, so the button, the share sheet and
+   the reminder can't drift apart. */
+function figuresFile(){
+  return {name:"money-weeks-backup-"+today()+".json",
+    text:JSON.stringify(Object.assign({},S,
+      {receiptPhotos:"not in this file - use Download your receipt photos for those"}),null,2)};
+}
+function markFiguresBackedUp(){ S.lastBackup=today(); S.lastBackupN=entryCount(); save(); render(); }
+/* Only a whole-library export counts as having the photos safe. A single financial
+   year is a useful thing to send an accountant, but treating it as a backup would
+   quietly tell him the other years are covered when they aren't. */
+function markPhotosBackedUp(fy){
+  if(fy!=="all"){ render(); return; }
+  S.lastPhotoBackup=today(); S.lastPhotoBackupN=photoCount(); save(); render();
+}
+/* Gathers a financial year of photos into one file. Shared by the download and the
+   share sheet; unchanged in what it produces. */
+function photosFile(fy){
+  const withPhoto=photosIn(fy);
+  if(!withPhoto.length) return Promise.resolve(null);
+  return Promise.all(withPhoto.map(e=>photoGet(e.id).then(b=>b?blobToData(b).then(u=>[e.id,u]):null)
+    .catch(()=>null))).then(pairs=>{
+      const photos={}; pairs.forEach(x=>{ if(x) photos[x[0]]=x[1]; });
+      const n=Object.keys(photos).length;
+      if(!n) return null;
+      const label=fy==="all"?"all":fyLabel(+fy);
+      return {n, name:"money-weeks-receipts-"+label+"-"+today()+".json",
+        text:JSON.stringify({type:"money-weeks-receipts",saved:today(),fy:label,photos})};
+    });
+}
+/* The share sheet is the point of this: a backup that only ever sits on the phone it
+   is backing up is not a backup. Cancelling is not a failure and isn't recorded. */
+function shareFile(file,then){
+  let f;
+  try{ f=new File([file.text],file.name,{type:"application/json"}); }
+  catch(e){ toast("This browser can't send files. Use the download button."); return; }
+  if(!(navigator.canShare&&navigator.canShare({files:[f]}))){
+    toast("This browser can't send files. Use the download button."); return;
+  }
+  navigator.share({files:[f],title:"Money Weeks backup"})
+    .then(()=>{ then(); toast("Sent. Keep it somewhere that isn't this phone."); })
+    .catch(err=>{ if(err&&err.name==="AbortError") return;      // he changed his mind
+      toast("Couldn't send it. The download button still works."); });
 }
 function render(){
   const y=window.scrollY;
@@ -1066,6 +1176,20 @@ function histRow(e){
   </div>`;
 }
 
+/* What the browser has actually promised about this data. Neither answer is dressed
+   up: knowing which situation he is in is the whole point of showing it. */
+function persistLine(){
+  if(S.persisted===true) return `<p class="note" style="margin-top:0">This phone has been asked to keep
+    this app's data and agreed, so it won't be cleared to make room for something else.
+    It can still go if you clear the browser's site data, or if the phone is lost or replaced
+    — that's what a copy off the phone is for.</p>`;
+  if(S.persisted===false) return `<div class="flag">This phone hasn't promised to keep this app's data,
+    so it may be cleared if storage runs low. Nothing is wrong, but it makes a copy off the phone
+    matter more.</div>`;
+  return `<p class="note" style="margin-top:0">This browser can't say whether it will keep this app's
+    data if storage runs low, so treat a copy off the phone as the thing keeping it safe.</p>`;
+}
+
 /* ---------- setup ---------- */
 function viewSetup(){
   const pYears=photoYears();
@@ -1107,11 +1231,16 @@ function viewSetup(){
   <div class="card">
     <h2>Keeping your data safe</h2>
     <p class="sub">Everything lives on this device only. Back it up now and then, and always before changing phones.</p>
+    ${persistLine()}
+    ${shareOK?`<button class="btn" data-act="share-backup">Send a copy off this phone</button>`:""}
     <button class="btn ghost" data-act="backup">Download a backup file</button>
     ${pYears.length>1?`<div class="chips" style="margin-top:12px">
       <button class="chip" data-act="photo-fy" data-id="all" aria-pressed="${photoFY==="all"}">All time (${photoCount()})</button>
       ${pYears.map(f=>`<button class="chip" data-act="photo-fy" data-id="${f}" aria-pressed="${photoFY===String(f)}">${fyLabel(f)} (${photoCount(f)})</button>`).join("")}
     </div>`:""}
+    ${shareOK&&photoCount(photoFY)?`<button class="btn ghost" data-act="share-photos">${photoFY==="all"
+      ? "Send your receipt photos off this phone ("+photoCount()+")"
+      : "Send "+fyLabel(+photoFY)+" receipt photos off this phone ("+photoCount(photoFY)+")"}</button>`:""}
     <button class="btn ghost" data-act="backup-photos">${photoFY==="all"
       ? "Download your receipt photos"+(photoCount()?" ("+photoCount()+")":"")
       : "Download "+fyLabel(+photoFY)+" receipt photos ("+photoCount(photoFY)+")"}</button>
@@ -1361,11 +1490,16 @@ document.getElementById("app").addEventListener("click",e=>{
        income:[], expenses:[], recurring:[], owed:[], repayments:[], investValues:[], adjustments:[]};
     if(sav||wal) S.income.push({id:uid(), date:today(), amount:sav+wal, toSavings:sav, invest:{}, opening:true});
     save(); tab = S.holdings.length ? "goal" : "pay"; render();
+    checkPersist(true);                      // after setup, not on first paint
     if(S.holdings.length) toast("Now put in what each investment is worth");
     return;
   }
   if(act==="tab"){ tab=btn.dataset.tab; moveMode=false; movePrefill=null; spendSub=null;
-    openRows={}; render(); return; }
+    openRows={}; render();
+    /* Existing saves never got asked at setup, so ask the first time he opens the tab
+       where the answer is shown. Already answered, this only re-reads the status. */
+    if(tab==="setup") checkPersist(S.persisted===undefined);
+    return; }
   if(act==="move-mode"){ moveMode=!moveMode; if(!moveMode) movePrefill=null; render(); return; }
   if(act==="sweep"){
     const d=derive();
@@ -1618,31 +1752,31 @@ document.getElementById("app").addEventListener("click",e=>{
     save(); render(); toast("Saved"); return;
   }
   if(act==="backup"){
-    download("money-weeks-backup-"+today()+".json",
-      JSON.stringify(Object.assign({},S,
-        {receiptPhotos:"not in this file - use Download your receipt photos for those"}),null,2));
-    if(S){ S.lastBackup=today(); save(); render(); }
+    const f=figuresFile();
+    download(f.name,f.text);
+    if(S) markFiguresBackedUp();
     toast(photoCount()?"Figures saved. Photos are a separate file.":"Backup downloaded"); return; }
+  if(act==="share-backup"){ shareFile(figuresFile(),markFiguresBackedUp); return; }
+  if(act==="hush-nudge"){ nudgeHushed=true; render(); return; }
   if(act==="read-toggle"){
     S.readReceipts=!S.readReceipts; save(); render();
     toast(S.readReceipts?"Receipts will be read from the photo":"Reading turned off, nothing will download");
     return; }
   if(act==="photo-fy"){ photoFY=btn.dataset.id; render(); return; }
-  if(act==="backup-photos"){
-    const fy=photoFY, withPhoto=photosIn(fy);
-    if(!withPhoto.length){ toast(fy==="all"?"No receipt photos yet":"No receipt photos in that year"); return; }
-    toast("Gathering "+withPhoto.length+" photos\u2026");
-    Promise.all(withPhoto.map(e=>photoGet(e.id).then(b=>b?blobToData(b).then(u=>[e.id,u]):null)
-      .catch(()=>null)))
-      .then(pairs=>{
-        const photos={}; pairs.forEach(x=>{ if(x) photos[x[0]]=x[1]; });
-        const n=Object.keys(photos).length;
-        if(!n){ toast("Couldn't read the photos back"); return; }
-        download("money-weeks-receipts-"+(fy==="all"?"all":fyLabel(+fy))+"-"+today()+".json",
-          JSON.stringify({type:"money-weeks-receipts",saved:today(),
-            fy:fy==="all"?"all":fyLabel(+fy),photos}));
-        toast(n+" receipt photos downloaded"+(fy==="all"?"":", "+fyLabel(+fy)));
-      }).catch(()=>toast("Couldn't read the photos back"));
+  if(act==="backup-photos"||act==="share-photos"){
+    const fy=act==="share-photos"&&btn.dataset.fy?btn.dataset.fy:photoFY;
+    const sending=act==="share-photos";
+    if(!photosIn(fy).length){ toast(fy==="all"?"No receipt photos yet":"No receipt photos in that year"); return; }
+    toast("Gathering "+photosIn(fy).length+" photos\u2026");
+    photosFile(fy).then(file=>{
+      if(!file){ toast("Couldn't read the photos back"); return; }
+      if(sending) shareFile(file,()=>markPhotosBackedUp(fy));
+      else{
+        download(file.name,file.text);
+        markPhotosBackedUp(fy);
+        toast(file.n+" receipt photos downloaded"+(fy==="all"?"":", "+fyLabel(+fy)));
+      }
+    }).catch(()=>toast("Couldn't read the photos back"));
     return; }
   if(act==="restore"){ document.getElementById("restore-file").click(); return; }
   if(act==="ask-wipe"){ confirmWipe=true; render(); return; }
@@ -1652,7 +1786,7 @@ document.getElementById("app").addEventListener("click",e=>{
     photoUrls={}; S=null; confirmWipe=false; tab="pay"; spendSub=null; render(); return; }
 });
 
-probeStorage(); load(); render();
+probeStorage(); probeShare(); load(); render();
 
 /* Works offline once installed. Skipped harmlessly when opened as a local file. */
 if("serviceWorker" in navigator && location.protocol.indexOf("http")===0){

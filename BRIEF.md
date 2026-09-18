@@ -118,7 +118,11 @@ payday are already subtracted, so "left to spend" is money that's genuinely avai
   goal: 40000,
   deadline: "2026-12-25",
   payDay: 3,                                   // 0=Sun … 3=Wed
-  lastBackup: "2026-09-07",                    // drives the 30-day nudge
+  lastBackup: "2026-09-07",                    // figures; drives the 14-day reminder
+  lastBackupN: 42,                             // entries at that moment, so the reminder can count what is new
+  lastPhotoBackup: "2026-07-01",               // photos; a slower rhythm, see below
+  lastPhotoBackupN: 12,
+  persisted: true,                             // what navigator.storage.persist() answered; null = browser can't say
   holdings:   [{ id, name }],                  // "VGS", "XRP", …
   income:     [{ id, date, amount, toSavings, invest: {holdingId: n}, moveLabel? }],
   expenses:   [{ id, date, amount, what, cat }],
@@ -173,7 +177,7 @@ Don't swap it for a bare `setMonth()`.
 | `manifest.webmanifest` | Makes it installable to the home screen. |
 | `sw.js` | Service worker, cache-first, so it opens with no signal. `vendor/` is kept out of `SHELL` and cached only once it is actually used. |
 | `vendor/` | The pinned receipt reader, about 10MB. Downloads on first use, never at install. |
-| backup `.json` | Every figure, no photos. Says so in the file. |
+| backup `.json` | Every figure, no photos. Says so in the file. Downloaded, or sent off the phone via the share sheet. |
 | receipts `.json` | Photos only, base64, much larger. Restore takes either. |
 | `icon-*.png` | App icons. |
 
@@ -221,6 +225,30 @@ No test harness. These are the cases that have actually broken:
     and made `advance()` lose a day per occurrence, so recurring bills drifted
     backwards through the calendar. Check `addMonths("2026-01-31", 1)` is
     `2026-02-28` and not the 27th.
+
+## Not losing it all
+
+Everything is on one phone, so three things guard against that, set out in `BACKUP.md`:
+
+`navigator.storage.persist()` is requested once after setup (and once for existing saves,
+the first time Setup is opened), so the browser won't evict the data when the phone fills
+up. The answer is reported plainly in Setup — granted or not — because he should know
+which situation he is in. It does nothing about clearing site data or a lost phone, and
+the wording says so.
+
+Both backups can go straight to the share sheet, which is the change that actually
+reduces risk: a backup sitting on the phone it is backing up is not a backup. Sharing is
+feature-detected with a real `navigator.canShare({files})` probe, never guessed from the
+platform, and the download buttons stay for everything else. A completed share is recorded
+exactly as a download is; a cancelled one is not.
+
+The reminder counts what is at stake — "19 entries and 7 receipt photos since your last
+backup" — rather than saying time has passed. Figures are due after 14 days, photos after
+90, and the two are worded separately because they have different rhythms. Never having
+backed up with more than a week of history gets a firmer card. It stays a card he can
+scroll past, with a Not now that hushes it for the session. A per-financial-year photo
+export deliberately does **not** count as a photo backup, or it would claim the other
+years are safe.
 
 ## Reading receipts
 

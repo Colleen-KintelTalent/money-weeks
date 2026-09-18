@@ -1,5 +1,5 @@
 /* Bump CACHE when you change index.html, otherwise phones keep the old copy. */
-const CACHE = "money-weeks-v11";
+const CACHE = "money-weeks-v12";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest",
                "./icon-192.png", "./icon-512.png", "./icon-maskable.png"];
 
