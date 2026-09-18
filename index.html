@@ -164,8 +164,9 @@ const DAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Satur
 
 let S=null, tab="pay", filter=null, confirmWipe=false, showRegulars=false,
     moveMode=false, movePrefill=null, moveFrom="spend", moveTo="save", storageOK=true;
-/* receipt form state, kept out of the DOM so a re-render never loses a photo */
-let receiptMode=false, noGst=false, invoiceHeld=false, gstTouched=false, pendingPhoto=null;
+/* receipt form state, kept out of the DOM so a re-render never loses a photo.
+   pendingPhotos is a queue: the first is the one being filled in, the rest wait their turn. */
+let receiptMode=false, noGst=false, invoiceHeld=false, gstTouched=false, pendingPhotos=[];
 /* history and claimable views */
 let spendSub=null, claimFY="all", histFilter="all", histSearch="", openHist={}, openRows={};
 let idbOK=true, photoUrls={};
@@ -624,6 +625,8 @@ function receiptBlock(){
       before you can claim the GST. Keep it and tick it off above.</div>
     <button class="btn ghost" data-act="snap">Photograph the receipt</button>
     <input type="file" id="rc-file" accept="image/*" capture="environment" style="display:none">
+    <button class="btn ghost" data-act="pick-photo">Choose a photo</button>
+    <input type="file" id="rc-pick" accept="image/*" multiple style="display:none">
     <div id="rc-prev"></div>
     <p class="note">GST is worked out as a rounded eleventh of the total, which is how it works here. Change it if
       the receipt says something different, or say there's none \u2014 fresh food and most medical aren't taxed.</p>
@@ -979,14 +982,20 @@ function updateGst(){
 }
 function resetReceipt(){
   receiptMode=false; noGst=false; invoiceHeld=false; gstTouched=false;
-  if(pendingPhoto&&pendingPhoto.url) URL.revokeObjectURL(pendingPhoto.url);
-  pendingPhoto=null;
+  dropPhotos();
+}
+function dropPhotos(){
+  pendingPhotos.forEach(p=>{ if(p.url) URL.revokeObjectURL(p.url); });
+  pendingPhotos=[];
 }
 function showPhoto(){
   const box=document.getElementById("rc-prev"); if(!box) return;
-  box.innerHTML=pendingPhoto?`<img class="thumb" src="${pendingPhoto.url}" alt="The receipt you just photographed">
+  const p=pendingPhotos[0], more=pendingPhotos.length-1;
+  box.innerHTML=p?`<img class="thumb" src="${p.url}" alt="The receipt about to be saved">
     <button class="link" data-act="unsnap">Remove this photo</button>
-    <span class="subtle"> ${Math.round(pendingPhoto.blob.size/1024)}KB</span>`:"";
+    <span class="subtle"> ${Math.round(p.blob.size/1024)}KB</span>
+    ${more>0?`<p class="note">${more} more photo${more>1?"s":""} waiting. Each one gets its own expense \u2014 fill
+      this one in, add it, and the next photo comes up.</p>`:""}`:"";
 }
 
 function wire(){
@@ -1001,15 +1010,22 @@ function wire(){
   if(sg) sg.addEventListener("input",()=>{ gstTouched=true; });
   showPhoto(); updateGst();
 
-  const rcf=document.getElementById("rc-file");
-  if(rcf) rcf.addEventListener("change",e=>{
-    const f=e.target.files[0]; e.target.value=""; if(!f) return;
-    toast("Shrinking the photo\u2026");
-    compress(f).then(b=>{
-      if(pendingPhoto&&pendingPhoto.url) URL.revokeObjectURL(pendingPhoto.url);
-      pendingPhoto={blob:b,url:URL.createObjectURL(b)}; showPhoto();
-    }).catch(()=>toast("Couldn't read that photo"));
-  });
+  /* The camera hands back one photo, the gallery can hand back several. Both land in the
+     same queue, one at a time \u2014 decoding a phoneful of 4MB images at once runs a phone
+     out of memory, and the preview fills in as each one is done. */
+  const takePhotos=e=>{
+    const files=Array.prototype.slice.call(e.target.files||[]); e.target.value="";
+    if(!files.length) return;
+    toast(files.length===1?"Shrinking the photo\u2026":"Shrinking "+files.length+" photos\u2026");
+    let bad=0;
+    files.reduce((p,f)=>p.then(()=>compress(f)
+      .then(b=>{ pendingPhotos.push({blob:b,url:URL.createObjectURL(b)}); showPhoto(); })
+      .catch(()=>{ bad++; })), Promise.resolve())
+      .then(()=>{ if(bad) toast(bad===files.length?"Couldn't read that photo"
+        :"Couldn't read "+bad+" of those photos"); });
+  };
+  ["rc-file","rc-pick"].forEach(id=>{ const el=document.getElementById(id);
+    if(el) el.addEventListener("change",takePhotos); });
 
   const hs=document.getElementById("h-search");
   if(hs) hs.addEventListener("input",()=>{ histSearch=hs.value;
@@ -1142,9 +1158,11 @@ document.getElementById("app").addEventListener("click",e=>{
     invoiceHeld=!invoiceHeld; btn.setAttribute("aria-pressed",String(invoiceHeld)); updateGst(); return;
   }
   if(act==="snap"){ const f=document.getElementById("rc-file"); if(f) f.click(); return; }
+  if(act==="pick-photo"){ const f=document.getElementById("rc-pick"); if(f) f.click(); return; }
   if(act==="unsnap"){
-    if(pendingPhoto&&pendingPhoto.url) URL.revokeObjectURL(pendingPhoto.url);
-    pendingPhoto=null; showPhoto(); return;
+    const p=pendingPhotos.shift();
+    if(p&&p.url) URL.revokeObjectURL(p.url);
+    showPhoto(); return;
   }
 
   if(act==="pick-cat"||act==="pick-rcat"){
@@ -1164,12 +1182,20 @@ document.getElementById("app").addEventListener("click",e=>{
       e2.gst=noGst?0:Math.round(num(val("s-gst"))*100)/100;
       e2.invoiceHeld=invoiceHeld;
     }
-    const blob=receiptMode&&pendingPhoto?pendingPhoto.blob:null;
-    const done=m=>{ resetReceipt(); save(); render(); toast(m); };
+    const shot=receiptMode&&pendingPhotos.length?pendingPhotos.shift():null;
+    const done=m=>{
+      if(shot&&shot.url) URL.revokeObjectURL(shot.url);
+      /* Photos still queued each want their own figures, so the form stays open for the next one. */
+      const left=receiptMode?pendingPhotos.length:0;
+      if(left){ noGst=false; invoiceHeld=false; gstTouched=false; }
+      else resetReceipt();
+      save(); render();
+      toast(left?m+" \u2014 "+left+" photo"+(left>1?"s":"")+" to go":m);
+    };
     S.expenses.push(e2);
-    if(blob){
+    if(shot){
       e2.photo=true;
-      photoPut(e2.id,blob).then(()=>done("Receipt saved"))
+      photoPut(e2.id,shot.blob).then(()=>done("Receipt saved"))
         .catch(()=>{ delete e2.photo; done("Saved, but this browser wouldn't keep the photo"); });
     }else done(receiptMode?"Receipt saved":"Added");
     return;
