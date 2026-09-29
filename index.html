@@ -48,8 +48,11 @@ body{margin:0;font-family:'Barlow',-apple-system,'Segoe UI',Roboto,sans-serif;ba
   border:1px solid rgba(20,36,51,.35);background:rgba(255,255,255,.5);color:var(--ink);cursor:pointer;font-family:inherit}
 .sweep:active{background:rgba(255,255,255,.85)}
 
-.tabs{display:flex;gap:4px;margin-top:12px;background:#d3dade;padding:4px;border-radius:5px}
-.tab{flex:1;padding:10px 1px;font-size:13px;font-weight:500;border:0;border-radius:3px;background:transparent;
+.tabs{display:flex;gap:3px;margin-top:12px;background:#d3dade;padding:3px;border-radius:5px}
+/* Six tabs, and 380px is the narrowest phone this has to work on. That leaves about
+   55px each, so the font and the gaps are what they are — "Spending" and "History"
+   both have to fit on one line without wrapping. Measure before adding a seventh. */
+.tab{flex:1;padding:10px 1px;font-size:12px;font-weight:500;border:0;border-radius:3px;background:transparent;
   color:var(--ink-2);cursor:pointer;font-family:inherit;white-space:nowrap}
 .tab[aria-selected="true"]{background:var(--card);color:var(--ink);font-weight:600;box-shadow:0 1px 2px rgba(20,36,51,.12)}
 
@@ -264,10 +267,15 @@ function migrate(o){
   if(typeof o.lastBackupN!=="number") o.lastBackupN=o.lastBackup?entriesIn(o):0;
   if(typeof o.lastPhotoBackupN!=="number") o.lastPhotoBackupN=0;
   delete o.receiptPhotos;                 // a note to whoever opens the backup file, not state
-  /* Saves from before savings corrections existed simply have no list yet. */
+  /* Saves from before savings corrections or the rent pot existed simply have no list
+     yet. An empty default is how a new list arrives without bumping KEY — a backup taken
+     before the rent pot came along restores cleanly with the pot at zero. */
   const st=Object.assign({income:[],expenses:[],recurring:[],owed:[],repayments:[],
-    investValues:[],holdings:[],adjustments:[],categories:DEFAULT_CATS},o);
+    investValues:[],holdings:[],adjustments:[],rentPaid:[],rentAdjustments:[],
+    categories:DEFAULT_CATS},o);
   if(!Array.isArray(st.adjustments)) st.adjustments=[];
+  if(!Array.isArray(st.rentPaid)) st.rentPaid=[];
+  if(!Array.isArray(st.rentAdjustments)) st.rentAdjustments=[];
   return st;
 }
 function load(){
@@ -282,6 +290,9 @@ function toast(m){ const t=document.createElement("div"); t.className="toast"; t
   t.setAttribute("role","status"); document.body.appendChild(t); setTimeout(()=>t.remove(),2600); }
 
 const investOf=i=>{ let t=0; const m=i.invest||{}; for(const k in m) t+=m[k]; return t; };
+/* The rent slice of an allocation. Absent on every entry written before the rent pot
+   existed, which is exactly what makes an old save read as a pot with nothing in it. */
+const rentOf=i=>i.toRent||0;
 
 /* ---------- receipt photos ----------
    Photos are blobs, and localStorage is a ~5MB string store — a handful of them would
@@ -528,16 +539,30 @@ function derive(){
   const growth=investVal-invested;
   const goalTotal=savings+investVal;
 
+  /* stream three: the rent pot, which is nobody else's business.
+     It is not in savings, not in a holding, and not in the wallet, so it can never be
+     counted towards the goal or offered up as money to spend. Rent set aside out of a
+     pay has already left the wallet by the line below, and rent paid only ever comes
+     off this balance. */
+  const rentIn=S.income.reduce((s,i)=>s+rentOf(i),0);
+  const rentOut=S.rentPaid.reduce((s,r)=>s+r.amount,0);
+  const rentAdjusted=S.rentAdjustments.reduce((s,a)=>s+a.amount,0);
+  const rent=rentIn-rentOut+rentAdjusted;
+
   /* stream two: spending money, a running balance that rolls over */
-  const intoWallet=S.income.reduce((s,i)=>s+(i.amount-i.toSavings-investOf(i)),0);
+  const intoWallet=S.income.reduce((s,i)=>s+(i.amount-i.toSavings-investOf(i)-rentOf(i)),0);
   const spent=S.expenses.reduce((s,e)=>s+e.amount,0);
   const wallet=intoWallet-spent;
 
-  /* bills due before the next payday, still unticked */
+  /* bills due before the next payday, still unticked. A bill paid from the rent pot is
+     counted apart: it never touches the wallet, so subtracting it from `safe` would take
+     the same money off him twice. */
   const endOfWeek=weekEnd(today());
-  let billsPending=0;
+  let billsPending=0, rentBillsPending=0;
   S.recurring.forEach(r=>{ let d=r.next,g=0;
-    while(d<=endOfWeek && g++<60){ billsPending+=r.amount; d=advance(d,r.freq); } });
+    while(d<=endOfWeek && g++<60){
+      if(r.fromRent) rentBillsPending+=r.amount; else billsPending+=r.amount;
+      d=advance(d,r.freq); } });
   const safe=wallet-billsPending;
 
   const left=weeksBetween(today(),S.deadline);
@@ -553,6 +578,7 @@ function derive(){
 
   const owedTotal=S.owed.reduce((s,o)=>s+o.amount,0);
   return {savings,repaid,adjusted,invested,investVal,growth,holdings,goalTotal,wallet,billsPending,safe,
+    rent,rentIn,rentOut,rentAdjusted,rentBillsPending,
     left,gap,required,weeks,rate,owedTotal,spent,
     projected: rate===null?null:goalTotal+rate*left};
 }
@@ -574,7 +600,8 @@ function warnBanner(){
 /* Everything he has typed in, which is what a lost phone would cost him. */
 function entriesIn(o){
   if(!o) return 0;
-  return ["income","expenses","recurring","owed","repayments","adjustments","investValues"]
+  return ["income","expenses","recurring","owed","repayments","adjustments","investValues",
+          "rentPaid","rentAdjustments"]
     .reduce((n,k)=>n+((o[k]||[]).length),0);
 }
 const entryCount=()=>entriesIn(S);
@@ -686,6 +713,10 @@ function screenSetup(){
       <div class="money"><span>$</span><input id="u-sav" class="in" inputmode="decimal" placeholder="0"></div></div>
     <div class="row"><label for="u-wal">Spending money on hand</label>
       <div class="money"><span>$</span><input id="u-wal" class="in" inputmode="decimal" placeholder="0"></div></div>
+    <div class="row"><label for="u-rent">In your rent account</label>
+      <div class="money"><span>$</span><input id="u-rent" class="in" inputmode="decimal" placeholder="0"></div></div>
+    <p class="note" style="margin-bottom:0">Rent money sits in a pot of its own. It never counts towards the goal
+      and never shows up as money you've got left to spend, so it can't be spent twice.</p>
   </div>
   <div class="card">
     <h2>Your investments</h2>
@@ -706,9 +737,11 @@ function screenMain(){
   const d=derive();
   const body = tab==="pay"?viewPay(d)
     :tab==="spend"?(spendSub==="claim"?viewClaim():viewSpend(d))
+    :tab==="rent"?viewRent(d)
     :tab==="goal"?viewGoal(d)
     :tab==="history"?viewHistory():viewSetup();
-  const tabs=[["pay","Pay"],["spend","Spending"],["goal","Goal"],["history","History"],["setup","Setup"]];
+  const tabs=[["pay","Pay"],["spend","Spending"],["rent","Rent"],["goal","Goal"],
+              ["history","History"],["setup","Setup"]];
   return warnBanner()+hero(d)+`<div class="tabs" role="tablist">`+
     tabs.map(([id,l])=>`<button class="tab" role="tab" data-act="tab" data-tab="${id}" aria-selected="${tab===id}">${l}</button>`).join("")+
     `</div>`+body;
@@ -758,7 +791,8 @@ function hero(d){
 /* ---------- pay ---------- */
 function potOptions(sel,d){
   const pots=[{id:"spend",name:"Spending money ("+money(d.safe)+")"},
-              {id:"save", name:"Savings ("+money(d.savings)+")"}]
+              {id:"save", name:"Savings ("+money(d.savings)+")"},
+              {id:"rent", name:"Rent pot ("+money(d.rent)+")"}]
     .concat(d.holdings.map(x=>({id:x.h.id,name:x.h.name+" ("+money(x.value)+")"})));
   return pots.map(p=>`<option value="${p.id}"${p.id===sel?" selected":""}>${esc(p.name)}</option>`).join("");
 }
@@ -768,7 +802,7 @@ function viewPay(d){
   return backupNudge()+`<div class="card">
     <h2>${moveMode?"Move money":"Money in"}</h2>
     <p class="sub">${ moveMode
-      ? "Shift money you already have between spending, savings and each investment. Take from savings to spend, buy an investment out of savings, sell one back into savings &mdash; whichever way round."
+      ? "Shift money you already have between spending, savings, the rent pot and each investment. Take from savings to spend, put some aside for rent, buy an investment out of savings, sell one back into savings &mdash; whichever way round."
       : "What you were paid, then how much of it you're setting aside. What's left becomes spending money." }</p>
     <div class="row"><label for="p-date">When</label>
       <div class="money"><input id="p-date" class="in plain" type="date" value="${moveMode?today():lastPayday()}"></div></div>
@@ -787,16 +821,23 @@ function viewPay(d){
       ${ S.holdings.map(h=>`<div class="row indent">
           <label for="p-h-${h.id}">of that, into ${esc(h.name)}</label>
           <div class="money"><span>$</span><input id="p-h-${h.id}" class="in pcalc hput" data-hid="${h.id}"
-            inputmode="decimal" placeholder="0"></div></div>`).join("") }`}
+            inputmode="decimal" placeholder="0"></div></div>`).join("") }
+      <div class="row indent"><label for="p-rent">of that, into the rent pot</label>
+        <div class="money"><span>$</span><input id="p-rent" class="in pcalc" inputmode="decimal" placeholder="0"></div></div>`}
     <div class="split">
       <div class="splitline"><span>Towards the goal</span><b class="num" id="p-goal">${money(0)}</b></div>
+      <div class="splitline" id="p-rent-line" hidden><span>Into the rent pot</span>
+        <b class="num" id="p-rentd">${money(0)}</b></div>
       <div class="splitline big"><span>${moveMode?"Change to spending money":"Left to spend"}</span>
         <b class="num" id="p-left">${money(0)}</b></div>
     </div>
     <button class="btn" data-act="${moveMode?"save-move":"save-pay"}">${moveMode?"Move it":"Save"}</button>
     <button class="link" data-act="move-mode">${moveMode?"Back to recording pay":"Move money between savings, investments and spending"}</button>
     ${ moveMode?`<p class="note">Moving into spending money doesn't count as spending. Log what you actually buy on the
-      Spending tab as usual.</p>`:""}
+      Spending tab as usual. Moving into the rent pot puts it out of reach of both the goal and your spending
+      money &mdash; pay it out on the Rent tab.</p>`
+      :`<p class="note">The rent pot is kept apart: what goes in there isn't part of the goal and isn't money
+        you've got left to spend.</p>`}
     ${ S.income.length?`<button class="link" data-act="tab" data-tab="history">See every pay and move in History</button>`:""}
   </div>`;
 }
@@ -804,6 +845,7 @@ function viewPay(d){
 /* ---------- spending ---------- */
 function viewSpend(d){
   const due=dueList(), dueTotal=due.reduce((s,x)=>s+x.r.amount,0);
+  const dueFromRent=due.some(x=>x.r.fromRent);
   const shown=filter?S.expenses.filter(e=>e.cat===filter):S.expenses;
   const map={}; shown.forEach(e=>{const k=weekEnd(e.date);(map[k]=map[k]||[]).push(e)});
   const groups=Object.keys(map).sort().reverse().map(k=>({week:k,
@@ -818,11 +860,14 @@ function viewSpend(d){
   return `
   ${ due.length?`<div class="card due">
     <h2>${due.length===1?"1 bill due":due.length+" bills due"}</h2>
-    <p class="sub">These come out of your spending money. Nothing is taken until you tick it off.</p>
+    <p class="sub">${dueFromRent
+      ? "Rent comes out of the rent pot, the rest out of your spending money."
+      : "These come out of your spending money."} Nothing is taken until you tick it off.</p>
     ${due.map((x,i)=>`<div class="exp">
       <span class="sw" style="background:${catOf(x.r.cat).color}"></span>
       <div class="expmain"><div class="expwhat">${esc(x.r.name)}</div>
-        <div class="expmeta">due ${shortDate(x.date)} &middot; ${freqLabel(x.r.freq)}</div></div>
+        <div class="expmeta">due ${shortDate(x.date)} &middot; ${freqLabel(x.r.freq)}${
+          x.r.fromRent?" &middot; from the rent pot":""}</div></div>
       <div class="expamt num">${money(x.r.amount,true)}</div>
       <button class="mini solid" data-act="log-due" data-i="${i}">Paid</button>
       <button class="mini" data-act="skip-due" data-i="${i}">Skip</button>
@@ -969,7 +1014,8 @@ function regularsBlock(){
     ${ S.recurring.length?S.recurring.map(r=>`<div class="exp">
         <span class="sw" style="background:${catOf(r.cat).color}"></span>
         <div class="expmain"><div class="expwhat">${esc(r.name)}</div>
-          <div class="expmeta">${freqLabel(r.freq)} &middot; next ${shortDate(r.next)}</div></div>
+          <div class="expmeta">${freqLabel(r.freq)} &middot; next ${shortDate(r.next)}${
+          r.fromRent?" &middot; from the rent pot":""}</div></div>
         <div class="expamt num">${money(r.amount,true)}</div>
         <button class="x" data-act="del-rec" data-id="${r.id}" aria-label="Remove">&times;</button>
       </div>`).join(""):`<div class="empty">No bills set up.</div>` }
@@ -983,7 +1029,85 @@ function regularsBlock(){
     <div class="row"><label for="r-next">Next one due</label>
       <div class="money"><input id="r-next" class="in plain" type="date" value="${today()}"></div></div>
     <div class="chips" id="r-cats">${S.categories.map(c=>`<button class="chip" data-act="pick-rcat" data-id="${c.id}" aria-pressed="${c.id==="bills"}"><span class="sw" style="background:${c.color}"></span>${esc(c.name)}</button>`).join("")}</div>
+    <div class="chips" style="margin-top:2px">
+      <button class="chip" id="r-rent" data-act="rec-rent" aria-pressed="false">Pay this from the rent pot</button>
+    </div>
+    <p class="subtle">Turn that on for rent itself. It then comes off the rent pot when you tick it,
+      so rent is never taken off your spending money as well.</p>
     <button class="btn ghost" data-act="add-rec">Save this bill</button>
+  </div>`;
+}
+
+/* ---------- rent ----------
+   A pot of its own, and the reason it exists is rule 1 applied to rent: two pots that
+   both claim the same dollar is how a tracker stops being believed. Rent money is not in
+   the goal, not in any holding, and not in "left to spend", so nothing here can move any
+   of those three. Rent goes in from a pay or a move, and only ever comes out again as
+   rent paid or a correction. */
+
+/* This pot's own ledger. Like History it only reports what was recorded elsewhere, so a
+   row can be deleted from it — except the rent slice of a pay, which isn't a thing of its
+   own: deleting it would have to take the whole pay with it, and that belongs in History. */
+function rentEvents(){
+  const out=[];
+  S.income.forEach(i=>{ const r=rentOf(i); if(!r) return;
+    const fromPay=i.amount>0;
+    out.push({id:i.id, date:i.date, amount:r,
+      what: fromPay?(i.opening?"Opening balance":"Set aside out of your pay"):(i.moveLabel||"Moved across"),
+      meta: fromPay?"from a pay":"moved between pots",
+      del: fromPay?null:"del-pay"}); });
+  S.rentPaid.forEach(r=>out.push({id:r.id, date:r.date, amount:-r.amount,
+    what:r.what||"Rent paid", meta:r.bill?"regular bill, out of this pot":"paid out of this pot",
+    del:"del-rentpaid"}));
+  S.rentAdjustments.forEach(a=>out.push({id:a.id, date:a.date, amount:a.amount,
+    what:"Correction "+(a.amount>=0?"+":"\u2212")+money(Math.abs(a.amount),true),
+    meta:a.note||"corrected to the real figure", del:"del-rentadj"}));
+  return out.sort((a,b)=>a.date===b.date?0:(a.date<b.date?1:-1));
+}
+
+function viewRent(d){
+  const rows=rentEvents(), fixed=rows.some(r=>!r.del);
+  return `<div class="card">
+    <h2>The rent pot</h2>
+    <p class="sub">Money set aside for rent, kept apart from everything else. It never counts towards the goal,
+      it isn't part of your investments, and it's never in what you've got left to spend.</p>
+    <div class="big"><span class="k">In the rent pot</span><span class="v num">${money(d.rent)}</span></div>
+    ${ d.rentBillsPending>0?`<p class="note" style="margin-top:0">${money(d.rentBillsPending,true)} of rent
+      due out of this pot on or before ${shortDate(weekEnd(today()))}. Tick it off with your other bills on the
+      Spending tab and it comes off here, not off your spending money.</p>`:""}
+    <button class="link" data-act="fix-rent">The real figure is different, fix it</button>
+    ${d.rentAdjusted?`<p class="note" style="margin-top:0">Corrections so far: ${
+      (d.rentAdjusted>0?"+":"")+money(d.rentAdjusted,true)}.</p>`:""}
+  </div>
+
+  <div class="card">
+    <h2>Paid rent</h2>
+    <p class="sub">Comes off this pot and nothing else. Your spending money, your savings and the goal don't move.</p>
+    <div class="row"><label for="rp-amt">How much</label>
+      <div class="money"><span>$</span><input id="rp-amt" class="in" inputmode="decimal" placeholder="0.00"></div></div>
+    <div class="row"><label for="rp-date">When</label>
+      <div class="money"><input id="rp-date" class="in plain" type="date" value="${today()}"></div></div>
+    <button class="btn" data-act="pay-rent">Paid rent</button>
+    <button class="link" data-act="move-to-rent">Move money into the rent pot</button>
+    ${ S.recurring.some(r=>r.fromRent)?"":`<p class="note">If rent goes out on the same day every month, set it up
+      as a regular bill on the Spending tab and tick &ldquo;pay this from the rent pot&rdquo;.</p>`}
+  </div>
+
+  <div class="card">
+    <h2>This pot</h2>
+    <p class="sub">Rent paid and money moved in, newest first.</p>
+    ${ !rows.length?`<div class="empty">Nothing in this pot yet. Put some aside on the Pay tab.</div>`
+      : rows.map(r=>`<div class="exp">
+        <div class="expmain"><div class="expwhat">${esc(r.what)}</div>
+          <div class="expmeta">${shortDate(r.date)} &middot; ${esc(r.meta)}</div></div>
+        <div class="expamt num ${r.amount<0?"down":"up"}">${r.amount<0?"\u2212":"+"}${money(Math.abs(r.amount),true)}</div>
+        ${ r.del?`<button class="x" data-act="${r.del}" data-id="${r.id}" aria-label="Delete">&times;</button>`
+          /* No delete on the rent slice of a pay, but the amounts still have to line up
+             with the rows that do have one. */
+          :`<span class="x" style="visibility:hidden" aria-hidden="true">&times;</span>` }
+      </div>`).join("") }
+    ${fixed?`<p class="note">Rent set aside out of a pay is part of that pay, so it's deleted with the pay
+      itself over in History.</p>`:""}
   </div>`;
 }
 
@@ -1082,8 +1206,9 @@ function viewOwed(d){
 }
 
 /* ---------- history ---------- */
-const HIST=[["all","All"],["in","Money in"],["out","Spending"],["move","Moves"],["inv","Investments"]];
-const HCOL={in:"#176b5c",out:"#b23f2a",move:"#4a6d8c",inv:"#8a6bbf"};
+const HIST=[["all","All"],["in","Money in"],["out","Spending"],["move","Moves"],
+            ["inv","Investments"],["rent","Rent"]];
+const HCOL={in:"#176b5c",out:"#b23f2a",move:"#4a6d8c",inv:"#8a6bbf",rent:"#a0713a"};
 
 /* One timeline out of every list. Nothing here derives a figure — it only reports what
    was recorded, so a row can be deleted straight from it. */
@@ -1091,10 +1216,12 @@ function events(){
   const out=[];
   S.income.forEach(i=>{
     const inv=investOf(i);
+    const rnt=rentOf(i);
     if(i.amount>0) out.push({id:i.id,del:"del-pay",type:"in",date:i.date,amount:i.amount,
       what:i.opening?"Opening balance":"Pay",
       detail:money(i.toSavings,true)+" to savings \u00b7 "+money(inv,true)+" invested \u00b7 "+
-        money(i.amount-i.toSavings-inv,true)+" to spend"});
+        (rnt?money(rnt,true)+" to rent \u00b7 ":"")+
+        money(i.amount-i.toSavings-inv-rnt,true)+" to spend"});
     else out.push({id:i.id,del:"del-pay",type:"move",date:i.date,amount:null,
       what:i.moveLabel||"Moved across",
       detail:"Money changed pots. Nothing came in and nothing was spent."});
@@ -1109,6 +1236,13 @@ function events(){
     out.push({id:v.id,del:"del-val",type:"inv",date:v.date,amount:null,
       what:(h?h.name:"An investment")+" valued at "+money(v.value),
       detail:"What it was worth that day. Valuing doesn't move any money."}); });
+  S.rentPaid.forEach(r=>out.push({id:r.id,del:"del-rentpaid",type:"rent",date:r.date,amount:-r.amount,
+    what:r.what||"Rent paid",hunt:"rent",
+    detail:"Out of the rent pot"+(r.bill?", a regular bill":"")+
+      ". Spending money, savings and the goal didn't move."}));
+  S.rentAdjustments.forEach(a=>out.push({id:a.id,del:"del-rentadj",type:"rent",date:a.date,amount:null,
+    what:"Rent pot correction "+(a.amount>=0?"+":"\u2212")+money(Math.abs(a.amount),true),hunt:"rent",
+    detail:(a.note?a.note+". ":"")+"A correction to the rent pot and nothing else."}));
   S.adjustments.forEach(a=>out.push({id:a.id,del:"del-adj",type:"inv",date:a.date,amount:null,
     what:"Savings correction "+(a.amount>=0?"+":"\u2212")+money(Math.abs(a.amount),true),
     detail:(a.note?a.note+". ":"")+"A correction, not money you put away."}));
@@ -1142,7 +1276,10 @@ function histBody(){
        have rows in them open up rather than making him tap through each one. */
     const items=map[k], open=openHist[k]??(k===now||!!q||histFilter!=="all");
     let inn=0, out=0, put=0;
-    items.forEach(e=>{ if(e.amount>0) inn+=e.amount; if(e.amount<0) out-=e.amount; });
+    /* The rent pot is its own stream, so rent paid is not "out" of spending money and
+       would misread this line if it were counted there. It has its own tab. */
+    items.forEach(e=>{ if(e.type==="rent") return;
+      if(e.amount>0) inn+=e.amount; if(e.amount<0) out-=e.amount; });
     /* Put away is read off the real lists, not the filtered rows, so the week still
        summarises itself honestly while a filter is on. */
     S.income.forEach(i=>{ if(weekEnd(i.date)===k) put+=i.toSavings+investOf(i); });
@@ -1262,23 +1399,37 @@ function viewSetup(){
 function updateSplit(){
   const g=document.getElementById("p-goal"); if(!g) return;
   const el=document.getElementById("p-left");
-  let goalDelta, spendDelta;
+  /* The rent line only appears when rent is actually in play, so an ordinary pay with
+     nothing set aside for rent reads exactly as it always did. */
+  const showRent=(delta,signed)=>{
+    const row=document.getElementById("p-rent-line"), b=document.getElementById("p-rentd");
+    if(!row||!b) return;
+    row.hidden = delta===0;
+    b.textContent=(signed&&delta>=0?"+":"")+money(delta);
+    b.className="num"+(delta<0?" down":"");
+  };
 
   if(moveMode){
     const from=val("m-from"), to=val("m-to"), amt=num(val("m-amt"));
-    goalDelta  = (to==="spend"?0:amt) - (from==="spend"?0:amt);
-    spendDelta = (to==="spend"?amt:0) - (from==="spend"?amt:0);
+    /* Only savings and the holdings are in the goal. Spending money and the rent pot
+       are both outside it, so moving between them leaves the goal alone. */
+    const inGoal=id=>id!=="spend"&&id!=="rent";
+    const part=pot=>(to===pot?amt:0)-(from===pot?amt:0);
+    const goalDelta  = (inGoal(to)?amt:0) - (inGoal(from)?amt:0);
     g.textContent=(goalDelta>=0?"+":"")+money(goalDelta);
     g.className="num"+(goalDelta<0?" down":"");
+    showRent(part("rent"),true);
+    const spendDelta=part("spend");
     el.textContent=(spendDelta>=0?"+":"")+money(spendDelta);
     el.className="num"+(spendDelta<0?" down":"");
     return;
   }
 
-  const amt=num(val("p-amt")), sav=num(val("p-sav"));
+  const amt=num(val("p-amt")), sav=num(val("p-sav")), rnt=num(val("p-rent"));
   let inv=0; document.querySelectorAll(".hput").forEach(i=>inv+=num(i.value));
   g.textContent=money(sav+inv); g.className="num";
-  const left=amt-sav-inv;
+  showRent(rnt,false);
+  const left=amt-sav-inv-rnt;
   el.textContent=money(left);
   el.className="num"+(left<0?" down":"");
 }
@@ -1484,11 +1635,15 @@ document.getElementById("app").addEventListener("click",e=>{
   if(act==="del-hold"){ btn.closest(".line").remove(); return; }
 
   if(act==="start"){
-    const sav=num(val("u-sav")), wal=num(val("u-wal"));
+    const sav=num(val("u-sav")), wal=num(val("u-wal")), rnt=num(val("u-rent"));
     S={goal:num(val("u-goal")), deadline:val("u-date"), payDay:parseInt(val("u-payday"),10)||0,
        readReceipts:true, categories:DEFAULT_CATS, holdings:readHoldLines("#setup-holds"),
-       income:[], expenses:[], recurring:[], owed:[], repayments:[], investValues:[], adjustments:[]};
-    if(sav||wal) S.income.push({id:uid(), date:today(), amount:sav+wal, toSavings:sav, invest:{}, opening:true});
+       income:[], expenses:[], recurring:[], owed:[], repayments:[], investValues:[], adjustments:[],
+       rentPaid:[], rentAdjustments:[]};
+    /* One opening entry covers all three: spending money is the remainder, so it needs no
+       term, while savings and rent each carry their own. */
+    if(sav||wal||rnt) S.income.push({id:uid(), date:today(), amount:sav+wal+rnt, toSavings:sav,
+      invest:{}, toRent:rnt, opening:true});
     save(); tab = S.holdings.length ? "goal" : "pay"; render();
     checkPersist(true);                      // after setup, not on first paint
     if(S.holdings.length) toast("Now put in what each investment is worth");
@@ -1512,19 +1667,23 @@ document.getElementById("app").addEventListener("click",e=>{
     if(amt<=0){ toast("How much?"); return; }
     if(from===to){ toast("Pick two different places"); return; }
 
-    const nameOf=id=>id==="spend"?"Spending":id==="save"?"Savings":
+    const nameOf=id=>id==="spend"?"Spending":id==="save"?"Savings":id==="rent"?"Rent":
       ((S.holdings.find(h=>h.id===id)||{}).name||"Investment");
-    const availableIn=id=>id==="spend"?d.safe:id==="save"?d.savings:
+    const availableIn=id=>id==="spend"?d.safe:id==="save"?d.savings:id==="rent"?d.rent:
       ((d.holdings.find(x=>x.h.id===id)||{}).value||0);
     if(amt>availableIn(from)+0.005){
       toast("Only "+money(availableIn(from))+" in "+nameOf(from)); return; }
 
-    /* A move is just an allocation entry with a minus on one side. */
-    const entry={id:uid(), date:val("p-date")||today(), amount:0, toSavings:0, invest:{},
+    /* A move is just an allocation entry with a minus on one side. Spending money is the
+       implied remainder and so needs no term of its own; the rent pot has one, because it
+       is a balance in its own right rather than what's left over. */
+    const entry={id:uid(), date:val("p-date")||today(), amount:0, toSavings:0, invest:{}, toRent:0,
       moveLabel:money(amt)+": "+nameOf(from)+" to "+nameOf(to)};
     if(from==="save") entry.toSavings-=amt;
+    else if(from==="rent") entry.toRent-=amt;
     else if(from!=="spend") entry.invest[from]=(entry.invest[from]||0)-amt;
     if(to==="save") entry.toSavings+=amt;
+    else if(to==="rent") entry.toRent+=amt;
     else if(to!=="spend") entry.invest[to]=(entry.invest[to]||0)+amt;
 
     S.income.push(entry);
@@ -1532,13 +1691,13 @@ document.getElementById("app").addEventListener("click",e=>{
     toast(nameOf(from)+" to "+nameOf(to)); return;
   }
   if(act==="save-pay"){
-    const sav=num(val("p-sav")), amt=num(val("p-amt"));
+    const sav=num(val("p-sav")), amt=num(val("p-amt")), rnt=num(val("p-rent"));
     const invest={}; let inv=0;
     document.querySelectorAll(".hput").forEach(i=>{
       const v=num(i.value); if(v){ invest[i.dataset.hid]=v; inv+=v; } });
-    if(!amt&&!sav&&!inv){ toast("Nothing to save yet"); return; }
-    if(sav+inv>amt){ toast("You're setting aside more than came in"); return; }
-    S.income.push({id:uid(), date:val("p-date")||today(), amount:amt, toSavings:sav, invest:invest});
+    if(!amt&&!sav&&!inv&&!rnt){ toast("Nothing to save yet"); return; }
+    if(sav+inv+rnt>amt){ toast("You're setting aside more than came in"); return; }
+    S.income.push({id:uid(), date:val("p-date")||today(), amount:amt, toSavings:sav, invest:invest, toRent:rnt});
     save(); render(); toast("Saved"); return;
   }
   if(act==="del-pay"){ S.income=S.income.filter(i=>i.id!==btn.dataset.id); save(); render(); return; }
@@ -1554,6 +1713,9 @@ document.getElementById("app").addEventListener("click",e=>{
       chips.forEach(c=>c.setAttribute("aria-pressed",String(c.dataset.id==="work")));
     }
     updateGst(); return;
+  }
+  if(act==="rec-rent"){
+    btn.setAttribute("aria-pressed",String(btn.getAttribute("aria-pressed")!=="true")); return;
   }
   if(act==="no-gst"){
     noGst=!noGst; btn.setAttribute("aria-pressed",String(noGst));
@@ -1670,21 +1832,39 @@ document.getElementById("app").addEventListener("click",e=>{
     const a=num(val("r-amt")), n=val("r-name").trim();
     if(!n||a<=0){ toast("Needs a name and an amount"); return; }
     const p=document.querySelector('#r-cats .chip[aria-pressed="true"]');
-    S.recurring.push({id:uid(), name:n, amount:a, freq:val("r-freq"),
-      next:val("r-next")||today(), cat:p?p.dataset.id:"bills"});
-    save(); render(); toast("Bill saved"); return;
+    const fr=document.getElementById("r-rent");
+    const rec={id:uid(), name:n, amount:a, freq:val("r-freq"),
+      next:val("r-next")||today(), cat:p?p.dataset.id:"bills"};
+    if(fr&&fr.getAttribute("aria-pressed")==="true") rec.fromRent=true;
+    S.recurring.push(rec);
+    save(); render(); toast(rec.fromRent?"Bill saved, it comes off the rent pot":"Bill saved"); return;
   }
   if(act==="del-rec"){ S.recurring=S.recurring.filter(r=>r.id!==btn.dataset.id); save(); render(); return; }
   if(act==="log-due"||act==="skip-due"){
     const item=dueList()[parseInt(btn.dataset.i,10)]; if(!item) return;
     const r=S.recurring.find(x=>x.id===item.r.id);
-    if(act==="log-due") S.expenses.push({id:uid(), date:item.date, amount:r.amount, what:r.name, cat:r.cat, bill:true});
+    if(act==="log-due"){
+      if(r.fromRent){
+        /* Rent comes off the rent pot and only the rent pot, which is the whole point of
+           the setting: without it rent would come off spending money as well. */
+        const d=derive();
+        if(r.amount>d.rent+0.005){
+          toast("Only "+money(d.rent)+" in the rent pot. Move money in first."); return; }
+        S.rentPaid.push({id:uid(), date:item.date, amount:r.amount, what:r.name, bill:true});
+      }else S.expenses.push({id:uid(), date:item.date, amount:r.amount, what:r.name, cat:r.cat, bill:true});
+    }
     r.next=advance(item.date,r.freq); save(); render();
-    toast(act==="log-due"?"Paid":"Skipped"); return;
+    toast(act==="skip-due"?"Skipped":r.fromRent?"Paid out of the rent pot":"Paid"); return;
   }
   if(act==="log-all-due"){
-    dueList().forEach(item=>{ const r=S.recurring.find(x=>x.id===item.r.id);
-      S.expenses.push({id:uid(), date:item.date, amount:r.amount, what:r.name, cat:r.cat, bill:true});
+    const items=dueList(), d=derive();
+    const rentDue=items.reduce((s,x)=>s+(x.r.fromRent?x.r.amount:0),0);
+    /* All of them or none: half a batch quietly logged is worse than being told why. */
+    if(rentDue>d.rent+0.005){
+      toast(money(rentDue)+" of rent due and only "+money(d.rent)+" in the pot. Move money in first."); return; }
+    items.forEach(item=>{ const r=S.recurring.find(x=>x.id===item.r.id);
+      if(r.fromRent) S.rentPaid.push({id:uid(), date:item.date, amount:r.amount, what:r.name, bill:true});
+      else S.expenses.push({id:uid(), date:item.date, amount:r.amount, what:r.name, cat:r.cat, bill:true});
       r.next=advance(item.date,r.freq); });
     save(); render(); toast("All logged"); return;
   }
@@ -1700,6 +1880,38 @@ document.getElementById("app").addEventListener("click",e=>{
       note:"Corrected from "+money(d.savings,true)+" to "+money(real,true)});
     save(); render(); toast(diff>0?money(diff,true)+" added":money(-diff,true)+" taken off"); return;
   }
+  if(act==="pay-rent"){
+    const d=derive(), a=num(val("rp-amt"));
+    if(a<=0){ toast("Put an amount in first"); return; }
+    /* The pot can't go under. Say what is actually in it rather than quietly going
+       negative, which would be a balance that can't exist in a real account. */
+    if(a>d.rent+0.005){ toast("Only "+money(d.rent)+" in the rent pot"); return; }
+    S.rentPaid.push({id:uid(), date:val("rp-date")||today(), amount:a, what:"Rent paid"});
+    save(); render(); toast(money(a)+" off the rent pot"); return;
+  }
+  if(act==="del-rentpaid"){ S.rentPaid=S.rentPaid.filter(r=>r.id!==btn.dataset.id); save(); render(); return; }
+  if(act==="move-to-rent"){
+    moveFrom="spend"; moveTo="rent"; moveMode=true; movePrefill=null; tab="pay"; render();
+    toast("Where it comes from is up to you"); return;
+  }
+  if(act==="fix-rent"){
+    const d=derive();
+    const said=prompt("How much have you actually got in your rent account?", Math.max(0,d.rent).toFixed(2));
+    if(said===null) return;
+    const real=num(said);
+    if(real<0){ toast("A rent account can't hold less than nothing"); return; }
+    const diff=Math.round((real-d.rent)*100)/100;
+    if(!diff){ toast("Already matches"); return; }
+    /* The delta, never the new total \u2014 rule 4, same as a savings correction. The history
+       behind it stays intact and the correction can be deleted like anything else. */
+    S.rentAdjustments.push({id:uid(), date:today(), amount:diff,
+      note:"Corrected from "+money(d.rent,true)+" to "+money(real,true)});
+    save(); render();
+    toast(diff>0?money(diff,true)+" added to the rent pot":money(-diff,true)+" taken off the rent pot"); return;
+  }
+  if(act==="del-rentadj"){ S.rentAdjustments=S.rentAdjustments.filter(a=>a.id!==btn.dataset.id);
+    save(); render(); return; }
+
   if(act==="del-adj"){ S.adjustments=S.adjustments.filter(a=>a.id!==btn.dataset.id); save(); render(); return; }
   if(act==="del-val"){ S.investValues=S.investValues.filter(v=>v.id!==btn.dataset.id); save(); render(); return; }
 

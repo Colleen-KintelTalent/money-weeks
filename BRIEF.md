@@ -14,7 +14,7 @@ fixed date.
 full rewrite because the first version tracked the wrong thing, and the rules below
 are what came out of that.
 
-## The model: two streams
+## The model: three streams
 
 Money arrives and is split straight away. That split is the whole app.
 
@@ -25,51 +25,65 @@ what the headline number and the deadline maths are about.
 money is set aside, minus spending and what bills take. It rolls over week to week
 — no reset, no weekly envelope. Underspending just means more the next week.
 
-The two never mix by accident. Logging an expense can never change the goal. Setting
-money aside can never look like spending. Every figure on screen is derived from
-four lists: allocations, expenses, valuations, corrections.
+**Stream three, the rent pot.** Money for rent, held apart from both of the others. It
+is not in the goal, not in any holding, and not in "left to spend". It only goes up when
+rent is set aside out of a pay or moved in from another pot, and only comes down when
+rent is paid or the balance is corrected. See rule 10.
+
+The three never mix by accident. Logging an expense can never change the goal. Setting
+money aside can never look like spending. Rent can never be spent twice. Every figure on
+screen is derived from six lists: allocations, expenses, valuations, corrections, rent
+paid and rent corrections.
 
 ### Derived quantities
 
 ```
 savings     = Σ income.toSavings + Σ repayments.amount + Σ adjustments.amount
+rent        = Σ income.toRent − Σ rentPaid.amount + Σ rentAdjustments.amount
 holding.put = Σ income.invest[holdingId]              // negative entries = sold down
 holding.value = lastValuation
                 ? lastValuation.value + Σ contributions dated after it
                 : holding.put                          // never valued: worth what went in
 holding.growth = value − put
 goalTotal   = savings + Σ holding.value
-wallet      = Σ (income.amount − toSavings − Σ invest) − Σ expenses
-billsPending= recurring occurrences due on or before the end of the current pay week
+wallet      = Σ (income.amount − toSavings − Σ invest − toRent) − Σ expenses
+billsPending= recurring occurrences due on or before the end of the current pay week,
+              excluding the ones marked fromRent
+rentBillsPending = the fromRent ones, counted against the rent pot instead
 safe        = wallet − billsPending                    // the "left to spend" figure
 required    = (goal − goalTotal) / weeks remaining
 rate        = mean of the last 4 pay weeks' (toSavings + invest + repayments)
 ```
 
-Note what `rate` leaves out: `adjustments`. A correction is not money he set aside, so it
-moves `savings` and the goal but never the weekly bars. See rules 4 and 5.
+Note what `rate` leaves out: `adjustments`, and everything to do with rent. A correction
+is not money he set aside, so it moves `savings` and the goal but never the weekly bars.
+Rent isn't goal money at all, so it is in neither. See rules 4, 5 and 10.
 
 Weeks run payday to the day before the next payday — Wednesday to Tuesday by default,
 set by `payDay` (0=Sunday). `weekEnd()` derives the boundary; don't hardcode Sunday.
 
 ### Transfers are allocations with a minus sign
 
-Moving money between pots — savings to spending, savings to XRP, VGS to savings, any
-direction — writes one income entry with `amount: 0` and a negative on the source
-side, positive on the destination. Spending money is the implied remainder, so it
-needs no explicit term.
+Moving money between pots — savings to spending, savings to XRP, VGS to savings, savings
+to rent, any direction — writes one income entry with `amount: 0` and a negative on the
+source side, positive on the destination. Spending money is the implied remainder, so it
+needs no explicit term. The rent pot is not a remainder, so it has one: `toRent`.
 
 ```js
 // VGS → Savings, $500
 { amount: 0, toSavings: +500, invest: { vgs: -500 } }
 // Savings → Spending, $300
 { amount: 0, toSavings: -300, invest: {} }
+// Savings → Rent, $900
+{ amount: 0, toSavings: -900, invest: {}, toRent: +900 }
+// Rent → Spending, $300      (spending is the remainder, so only rent carries a term)
+{ amount: 0, toSavings: 0, invest: {}, toRent: -300 }
 ```
 
 This is why no separate transfer concept exists, and why adding one would be a
 regression. It also means the arithmetic is verifiable: savings + investments +
-spending money always equals everything paid in, plus real investment growth, minus
-everything spent.
+spending money + the rent pot always equals everything paid in, plus real investment
+growth, minus everything spent and all rent paid.
 
 ## Design rules — please don't undo these
 
@@ -111,6 +125,16 @@ Backup and restore are JSON file download and upload.
 **9. `safe`, not `wallet`, is what's shown.** Bills falling due before the next
 payday are already subtracted, so "left to spend" is money that's genuinely available.
 
+**10. Rent money is spent once.** The rent pot is outside the goal, outside the
+investments and outside "left to spend", because it is money already committed. A
+regular bill can be marked `fromRent`, and then ticking it off comes out of the pot and
+never out of spending money — which is the whole reason the flag exists. `billsPending`
+counts only the bills that will actually hit the wallet, or rent would be deducted from
+what he has left to spend on top of having been set aside for. The pot is never allowed
+below zero: a move, a rent payment or a rent-pot bill that the balance won't cover is
+refused with the figure that is actually in it, rather than quietly going negative. Rent
+corrections follow rule 4 — the delta, never the new total.
+
 ## Data shape
 
 ```js
@@ -124,12 +148,14 @@ payday are already subtracted, so "left to spend" is money that's genuinely avai
   lastPhotoBackupN: 12,
   persisted: true,                             // what navigator.storage.persist() answered; null = browser can't say
   holdings:   [{ id, name }],                  // "VGS", "XRP", …
-  income:     [{ id, date, amount, toSavings, invest: {holdingId: n}, moveLabel? }],
+  income:     [{ id, date, amount, toSavings, invest: {holdingId: n}, toRent, moveLabel? }],
   expenses:   [{ id, date, amount, what, cat }],
-  recurring:  [{ id, name, amount, freq, next, cat }],   // weekly|fortnightly|monthly
+  recurring:  [{ id, name, amount, freq, next, cat, fromRent? }],  // weekly|fortnightly|monthly
   owed:       [{ id, who, amount }],
   repayments: [{ id, date, who, amount }],
   adjustments:[{ id, date, amount, note }],    // savings corrections; amount is the delta
+  rentPaid:   [{ id, date, amount, what, bill? }],      // rent out of the rent pot only
+  rentAdjustments:[{ id, date, amount, note }],         // rent corrections; also a delta
   investValues:[{ id, date, hid, value }],     // manual valuations, sorted by date
   categories: [{ id, name, color }]
 }
@@ -144,7 +170,10 @@ in the claimable list is driven by. `readReceipts` on the state turns the reader
 `KEY` is `moneyweeks:v4`; `load()` migrates a `v3` save by folding its single lump of
 investments into one holding. Bump `KEY` only alongside a migration, or existing
 users lose everything. New lists are added by giving `migrate()` an empty default, which
-is how `adjustments` arrived without a bump.
+is how `adjustments`, and later `rentPaid` and `rentAdjustments`, arrived without a bump.
+`toRent` is absent on every entry written before the rent pot existed, which is exactly
+what makes a backup taken back then restore with the pot at zero — read it through
+`rentOf()`, never as `i.toRent`.
 
 Photos are separate: database `moneyweeks-receipts`, store `photos`, one JPEG blob per
 expense id. Nothing derives from it — it is only ever displayed.
@@ -157,10 +186,13 @@ the keyboard. All clicks go through one delegated listener keyed by `data-act`.
 Adding a feature means: a view function, a `data-act` branch, and a field in the
 shape above.
 
-Five tabs is the ceiling at 380px: Pay, Spending, Goal, History, Setup. Owed is a section
-on Goal, and the claimable view is a sub-screen of Spending (`spendSub`). Each thing lives
-in one place — History is the only full list of past activity, and the Spending tab shows
-the current week only.
+Six tabs is the ceiling at 380px: Pay, Spending, Rent, Goal, History, Setup. Six is not a
+guess — at 380px each tab gets about 55px, and the widest label, "Spending", needs about
+50px of that at the 12px the tab bar uses. A seventh would not fit and neither would a
+longer label, so measure before adding either. Owed is a section on Goal, and the
+claimable view is a sub-screen of Spending (`spendSub`). Each thing lives in one place —
+History is the only full list of past activity, the Spending tab shows the current week
+only, and the Rent tab shows that one pot's own ledger.
 
 Two exceptions to "`render()` rebuilds everything": the receipt half of the expense form
 is shown and hidden in place, and the History search box refills only `#hist-body`. Both
@@ -184,7 +216,7 @@ Don't swap it for a bare `setMonth()`.
 Static host, served over **https** (or `localhost`) or the service worker won't
 register. All files in one directory; paths are relative.
 
-**After any change to `index.html`, bump `CACHE` in `sw.js`.** It's on `money-weeks-v5`
+**After any change to `index.html`, bump `CACHE` in `sw.js`.** It's on `money-weeks-v14`
 now. Skip this and installed phones keep serving the cached old copy.
 
 Local testing: `python3 -m http.server 8000`. Opening `index.html` as a `file://` URL
@@ -208,7 +240,8 @@ No test harness. These are the cases that have actually broken:
    spending money, Skip doesn't.
 7. Someone repays part of what they owe → savings rises, the debt falls, the goal was
    never inflated beforehand.
-8. Sum check: savings + investments + spending money = paid in + growth − spent.
+8. Sum check: savings + investments + spending money + the rent pot = paid in +
+   growth − spent − rent paid.
 9. Backup, wipe, restore → everything returns. Restore is offered on the first-run
    screen too, which is the only place a new phone can reach it.
 10. Photograph a receipt over $82.50: GST fills in as a rounded eleventh, the tax-invoice
@@ -217,7 +250,19 @@ No test harness. These are the cases that have actually broken:
 11. Correct the savings balance: savings and the goal move by the difference, spending
    money doesn't, and **the weekly bars are unchanged**.
 12. Airplane mode from the home screen → still opens.
-13. **Dates must not shift by a day.** Every date helper formats from local
+13. Pay split with rent: goal, investments and left to spend only change by their own
+    parts, and the four parts add back up to the pay.
+14. Paid rent: only the rent pot changes. The goal, savings, investments, left to spend
+    and the weekly bars are all untouched.
+15. Move money savings → rent and back again: the goal total ends where it started, and
+    spending money never moved at all.
+16. Rent "fix it": only the rent pot changes, an `adjustments`-style delta is stored, and
+    the weekly bars don't move.
+17. Restore a backup taken before the rent pot existed → loads with rent at zero and the
+    pot works from there. Take a fresh backup and the rent data comes back with it.
+18. A regular bill marked "pay this from the rent pot" comes off the pot and **not** off
+    spending money. Left to spend must not fall when it's ticked.
+19. **Dates must not shift by a day.** Every date helper formats from local
     calendar components via `isoLocal()`. Building one with
     `new Date(...).toISOString().slice(0,10)` parses at local midnight and then
     converts to UTC, which rolls back a day in any UTC-positive timezone. That
