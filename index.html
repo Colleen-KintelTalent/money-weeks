@@ -127,6 +127,17 @@ input,select{font-family:inherit;color:var(--ink)}
 .spark div{flex:1;background:#dbe2e5;border-radius:1px 1px 0 0;min-height:2px}
 .spark div.last{background:var(--ink)}
 .up{color:var(--ahead)} .down{color:var(--behind)}
+/* Put in, worth now, up or down: the first thing on each card. Three across fits the
+   326px a card has inside at 380px, with "+$12,345" at 22px as the widest figure. */
+.holdtap{display:block;width:100%;padding:0;border:0;background:none;font-family:inherit;color:var(--ink);
+  text-align:left;cursor:pointer}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:6px}
+.stat .k{display:block;font-size:12px;color:var(--ink-2)}
+.stat .v{display:block;font-size:22px;font-weight:600;line-height:1.15;white-space:nowrap}
+.stat .pc{display:block;font-size:14px;font-weight:600}
+.lock{font-size:13px;color:#9aa8b1;padding:0 4px}
+.toast button{margin-left:14px;padding:0;border:0;background:none;color:var(--hv);font:inherit;font-weight:600;
+  text-decoration:underline;cursor:pointer}
 
 .line{display:flex;gap:8px;align-items:center;margin-bottom:8px}
 .line input.nm{flex:1;padding:10px;font-size:16px;border:1px solid var(--line);border-radius:4px;background:#fbfcfc}
@@ -162,8 +173,8 @@ input,select{font-family:inherit;color:var(--ink)}
 <div class="wrap" id="app"></div>
 <script>
 "use strict";
-const KEY = "moneyweeks:v4";
-const OLD_KEY = "moneyweeks:v3";
+const KEY = "moneyweeks:v5";
+const OLD_KEYS = ["moneyweeks:v4","moneyweeks:v3"];         // newest first; each is left where it was
 
 const DEFAULT_CATS = [
   {id:"food", name:"Food & drink",    color:"#f5c518"},
@@ -173,10 +184,16 @@ const DEFAULT_CATS = [
   {id:"work", name:"Work, claimable", color:"#b23f2a"},
   {id:"other",name:"Other",           color:"#8c9aa3"}
 ];
+/* Categories the sums depend on. Work drives the claimable list and the GST, and Other is
+   where an expense goes when its category is removed, so neither can be renamed or removed. */
+const LOCKED_CATS = ["work","other"];
+const CAT_COLORS = ["#d9822b","#3f8fbf","#6b8e23","#c2577a","#5b6abf","#a0713a","#4ec2a8","#7d8f9a"];
 const DAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
 
 let S=null, tab="pay", filter=null, confirmWipe=false, showRegulars=false,
-    moveMode=false, movePrefill=null, moveFrom="spend", moveTo="save", storageOK=true;
+    movePrefill=null, moveFrom="sort", moveTo="save", storageOK=true, editCats=false;
+/* closing and deleting investments, from Setup */
+let showClosed=false, closingId=null, purgeId=null;
 /* receipt form state, kept out of the DOM so a re-render never loses a photo.
    pendingPhotos is a queue: the first is the one being filled in, the rest wait their turn. */
 let receiptMode=false, noGst=false, invoiceHeld=false, gstTouched=false, pendingPhotos=[];
@@ -276,16 +293,50 @@ function migrate(o){
   if(!Array.isArray(st.adjustments)) st.adjustments=[];
   if(!Array.isArray(st.rentPaid)) st.rentPaid=[];
   if(!Array.isArray(st.rentAdjustments)) st.rentAdjustments=[];
+  /* v5. Nothing already entered changes: the Pay pot (`toSort`) is absent on every older
+     entry, which reads as an empty pot, and a holding without `closed` is open. What v5
+     adds is that categories are always referred to by id and the locked two always exist,
+     so an expense pointing at a category that's gone is filed under Other — where
+     catOf() was already showing it — rather than left dangling. */
+  st.categories=(Array.isArray(st.categories)&&st.categories.length?st.categories:DEFAULT_CATS)
+    .map(c=>Object.assign({},c));
+  LOCKED_CATS.forEach(id=>{ if(!st.categories.some(c=>c.id===id))
+    st.categories.push(Object.assign({},DEFAULT_CATS.find(c=>c.id===id))); });
+  const known={}; st.categories.forEach(c=>known[c.id]=1);
+  st.expenses.forEach(e=>{ if(!known[e.cat]) e.cat="other"; });
+  st.recurring.forEach(r=>{ if(!known[r.cat]) r.cat="other"; });
   return st;
 }
+/* A save is only used if it looks like one: missing, unreadable, or "null" all count as
+   no data, so none of them can hide an older copy that is still sitting there. */
+const usable=o=>!!o&&typeof o==="object"&&Array.isArray(o.income);
+function readKey(k){ try{ const r=localStorage.getItem(k); return r?JSON.parse(r):null; }catch(e){ return null; } }
 function load(){
-  try{
-    let r=localStorage.getItem(KEY);
-    if(!r){ r=localStorage.getItem(OLD_KEY); if(r){ S=migrate(JSON.parse(r)); save(); return; } }
-    if(r) S=migrate(JSON.parse(r));
-  }catch(e){ S=null; }
+  const cur=readKey(KEY);
+  if(usable(cur)){ S=migrate(cur); return; }
+  /* No v5 data: copy the newest older save forward and leave it where it was, so the
+     migration can always be run again from it (see Recover in Setup). Whatever was in
+     the v5 slot is kept aside rather than written over. */
+  for(const k of OLD_KEYS){
+    const o=readKey(k); if(!usable(o)) continue;
+    try{ const raw=localStorage.getItem(KEY); if(raw) localStorage.setItem(KEY+":unreadable",raw); }catch(e){}
+    S=migrate(o); save(); return;
+  }
+  S=null;
 }
-function save(){ if(!storageOK) return; try{ localStorage.setItem(KEY,JSON.stringify(S)); }catch(e){ storageOK=false; } }
+/* Put back the save from before the update, migrated again. What's here now is kept on
+   the phone too, and the swap can be undone for a few seconds. */
+function recoverV4(){
+  const old=readKey(OLD_KEYS[0]);
+  if(!usable(old)){ toast("There's no copy from before the update on this phone"); return; }
+  if(!confirm("Put your data back exactly as it was before the update? Anything you've entered since "+
+    "the update will be replaced. You can undo it for a few seconds afterwards.")) return;
+  try{ localStorage.setItem(KEY+":before-recover",JSON.stringify(S)); }catch(e){}
+  removeWithUndo("Recovered your data from before the update",()=>{ S=migrate(old); });
+}
+function save(){
+  if(undoSnap) settleUndo();             // anything saved after a delete makes the undo copy stale
+  if(!storageOK) return; try{ localStorage.setItem(KEY,JSON.stringify(S)); }catch(e){ storageOK=false; } }
 function toast(m){ const t=document.createElement("div"); t.className="toast"; t.textContent=m;
   t.setAttribute("role","status"); document.body.appendChild(t); setTimeout(()=>t.remove(),2600); }
 
@@ -293,6 +344,66 @@ const investOf=i=>{ let t=0; const m=i.invest||{}; for(const k in m) t+=m[k]; re
 /* The rent slice of an allocation. Absent on every entry written before the rent pot
    existed, which is exactly what makes an old save read as a pot with nothing in it. */
 const rentOf=i=>i.toRent||0;
+/* The Pay pot's slice, read the same way: absent on everything written before it existed.
+   It's stored as `toSort` because that's what it was first called; the name on screen is
+   Pay pot, and renaming the field would mean another migration for no gain. */
+const sortOf=i=>i.toSort||0;
+const potLabel=id=>id==="spend"?"Spending money":id==="save"?"Savings":id==="rent"?"Rent pot":id==="sort"?"Pay pot":
+  ((S.holdings.find(h=>h.id===id)||{}).name||"a deleted investment");
+/* Whole dollars read as "$200", anything else keeps its cents. */
+const cash=n=>Math.abs(Math.round(n*100)%100)?money(n,true):money(n);
+
+/* Every place an entry moves money, with spending money worked out as the implied
+   remainder: whatever the pay brought in that no other term took. */
+function sidesOf(i){
+  const s=[["save",i.toSavings||0],["rent",rentOf(i)],["sort",sortOf(i)]];
+  for(const k in (i.invest||{})) s.push([k,i.invest[k]]);
+  s.push(["spend",Math.round((i.amount-s.reduce((a,x)=>a+x[1],0))*100)/100]);
+  return s.filter(x=>Math.abs(x[1])>0.004);
+}
+/* A move in words, worked out from the entry each time so it always uses today's names.
+   An old entry that moved money more than one way keeps the label it was saved with. */
+function moveText(i){
+  const s=sidesOf(i), out=s.filter(x=>x[1]<0), inn=s.filter(x=>x[1]>0);
+  if(out.length===1&&inn.length===1) return "Moved "+cash(inn[0][1])+" from "+potLabel(out[0][0])+
+    " to "+potLabel(inn[0][0])+(i.closing?", closing "+potLabel(i.closing):"");
+  return i.moveLabel||"Moved between pots";
+}
+
+/* ---------- deleting, with undo ----------
+   Every delete is confirmed first and can be taken back for a few seconds after. The undo
+   is a copy of the figures from just before, so it puts back exactly what was there, and
+   it lapses the moment anything else is saved so it can never roll back something newer.
+   `after` is whatever can't be taken back, like a receipt photo, held until then. */
+let undoSnap=null, undoTimer=null, undoAfter=null, undoEl=null;
+function settleUndo(){
+  const after=undoAfter;
+  if(undoTimer) clearTimeout(undoTimer);
+  if(undoEl) undoEl.remove();
+  undoSnap=undoTimer=undoAfter=undoEl=null;
+  if(after) after();
+}
+function removeWithUndo(msg,change,after){
+  settleUndo();
+  const snap=JSON.stringify(S), was=derive();
+  change();
+  /* The pots that can't go below zero still can't. Taking away a pay whose money has since
+     been sorted, or a move into rent that's since been paid out, is refused with the reason. */
+  const d=derive(), under=(k,name)=>d[k]<-0.005&&d[k]<was[k]-0.005?name:null;
+  const pot=under("toSort","the Pay pot")||under("rent","the rent pot");
+  if(pot){ S=JSON.parse(snap);
+    toast("That would leave "+pot+" below zero. Delete what was moved out of it first."); return false; }
+  save(); renderKeeping();
+  undoSnap=snap; undoAfter=after||null;
+  const t=document.createElement("div"); t.className="toast"; t.setAttribute("role","status");
+  t.appendChild(document.createTextNode(msg));
+  const b=document.createElement("button"); b.textContent="Undo"; t.appendChild(b);
+  b.addEventListener("click",()=>{ const back=undoSnap; if(!back) return;
+    undoAfter=null; settleUndo(); S=JSON.parse(back); save(); renderKeeping(); toast("Put back"); });
+  document.body.appendChild(t); undoEl=t;
+  undoTimer=setTimeout(settleUndo,6000);
+  return true;
+}
 
 /* ---------- receipt photos ----------
    Photos are blobs, and localStorage is a ~5MB string store — a handful of them would
@@ -522,8 +633,12 @@ function derive(){
   const savings=toSavings+repaid+adjusted;
 
   /* each holding tracked on its own, then added up */
+  /* Closed ones included: closing hides a holding, it doesn't take its past out of the sums. */
   const holdings=S.holdings.map(h=>{
-    const put=S.income.reduce((s,i)=>s+((i.invest||{})[h.id]||0),0);
+    /* Money moved in less money moved out, plus anything put in before he used the app.
+       That counts as put in the same way the opening balance does for savings, so it
+       isn't read as growth. */
+    const put=S.income.reduce((s,i)=>s+((i.invest||{})[h.id]||0),0)+(h.before||0);
     const hist=S.investValues.filter(v=>v.hid===h.id);
     const lastV=hist.length?hist[hist.length-1]:null;
     /* Money paid in or pulled out after the last valuation moves the value with it,
@@ -549,8 +664,13 @@ function derive(){
   const rentAdjusted=S.rentAdjustments.reduce((s,a)=>s+a.amount,0);
   const rent=rentIn-rentOut+rentAdjusted;
 
+  /* The Pay pot: every pay lands here whole. Like the rent pot it's a balance of its own,
+     outside the goal and outside the wallet, so a pay raises neither until he moves it.
+     It only goes up from a pay (or a move back in) and only comes down by a move. */
+  const toSort=S.income.reduce((s,i)=>s+sortOf(i),0);
+
   /* stream two: spending money, a running balance that rolls over */
-  const intoWallet=S.income.reduce((s,i)=>s+(i.amount-i.toSavings-investOf(i)-rentOf(i)),0);
+  const intoWallet=S.income.reduce((s,i)=>s+(i.amount-i.toSavings-investOf(i)-rentOf(i)-sortOf(i)),0);
   const spent=S.expenses.reduce((s,e)=>s+e.amount,0);
   const wallet=intoWallet-spent;
 
@@ -578,6 +698,7 @@ function derive(){
 
   const owedTotal=S.owed.reduce((s,o)=>s+o.amount,0);
   return {savings,repaid,adjusted,invested,investVal,growth,holdings,goalTotal,wallet,billsPending,safe,
+    open:holdings.filter(x=>!x.h.closed), toSort,
     rent,rentIn,rentOut,rentAdjusted,rentBillsPending,
     left,gap,required,weeks,rate,owedTotal,spent,
     projected: rate===null?null:goalTotal+rate*left};
@@ -691,11 +812,18 @@ function render(){
   wire(); window.scrollTo(0,y);
 }
 
-function holdLine(h){
+/* `full` is the Setup tab, where a holding can also carry what went in before the app and,
+   once anything has been recorded against it, is closed rather than removed. */
+function holdLine(h,full){
+  const used=full&&holdingUsed(h.id);
   return `<div class="line" data-id="${h.id}">
     <input class="nm hold-name" value="${esc(h.name||"")}" placeholder="e.g. VGS, XRP, Bitcoin" aria-label="Investment name">
-    <button class="x" data-act="del-hold" aria-label="Remove">&times;</button></div>`;
+    ${full?`<div class="money" style="width:96px"><span>$</span><input class="in hold-before" inputmode="decimal"
+      placeholder="0" value="${h.before||""}" aria-label="Already put in before using the app"></div>`:""}
+    ${used?`<button class="mini" data-act="close-hold" data-id="${h.id}">Close</button>`
+      :`<button class="x" data-act="del-hold" aria-label="Remove">&times;</button>`}</div>`;
 }
+const holdingUsed=id=>S.income.some(i=>(i.invest||{})[id])||S.investValues.some(v=>v.hid===id);
 
 function screenSetup(){
   return `<h1 class="title">Set up your tracker</h1>
@@ -772,7 +900,8 @@ function hero(d){
           :"Short by "+money(d.required-d.rate)+" a week"}
       </div>
       <div class="verdict-sub">Savings ${money(d.savings)} &middot; investments ${money(d.investVal)}${
-        d.rate!==null?" &middot; lately "+money(d.rate)+" a week":""}</div>
+        d.rate!==null?" &middot; lately "+money(d.rate)+" a week":""}${
+        d.toSort>0.005?" &middot; "+money(d.toSort)+" in the Pay pot":""}</div>
       ${d.owedTotal>0?`<div class="verdict-sub" style="margin-top:4px">${money(d.owedTotal)} owed to you, not counted until it's paid.</div>`:""}
     </div>
   </div>
@@ -788,56 +917,46 @@ function hero(d){
   </div>`;
 }
 
-/* ---------- pay ---------- */
+/* ---------- pay ----------
+   Pay goes into the Pay pot whole, and Move money is the only way anything leaves it.
+   One form for every move, from any place to any other, so there's one way to do it. */
+const balanceOf=(id,d)=>id==="spend"?d.safe:id==="save"?d.savings:id==="rent"?d.rent:id==="sort"?d.toSort:
+  ((d.holdings.find(x=>x.h.id===id)||{}).value||0);
 function potOptions(sel,d){
-  const pots=[{id:"spend",name:"Spending money ("+money(d.safe)+")"},
-              {id:"save", name:"Savings ("+money(d.savings)+")"},
-              {id:"rent", name:"Rent pot ("+money(d.rent)+")"}]
-    .concat(d.holdings.map(x=>({id:x.h.id,name:x.h.name+" ("+money(x.value)+")"})));
-  return pots.map(p=>`<option value="${p.id}"${p.id===sel?" selected":""}>${esc(p.name)}</option>`).join("");
+  const pots=["sort","spend","save","rent"].concat(d.open.map(x=>x.h.id));
+  return pots.map(id=>`<option value="${id}"${id===sel?" selected":""}>${
+    esc(potLabel(id)+" ("+money(balanceOf(id,d))+")")}</option>`).join("");
 }
 
 function viewPay(d){
   const pre=movePrefill?movePrefill.toFixed(2):"";
   return backupNudge()+`<div class="card">
-    <h2>${moveMode?"Move money":"Money in"}</h2>
-    <p class="sub">${ moveMode
-      ? "Shift money you already have between spending, savings, the rent pot and each investment. Take from savings to spend, put some aside for rent, buy an investment out of savings, sell one back into savings &mdash; whichever way round."
-      : "What you were paid, then how much of it you're setting aside. What's left becomes spending money." }</p>
-    <div class="row"><label for="p-date">When</label>
-      <div class="money"><input id="p-date" class="in plain" type="date" value="${moveMode?today():lastPayday()}"></div></div>
-    ${ moveMode ? `
-      <div class="row"><label for="m-from">From</label>
-        <div class="money"><select id="m-from" class="sel pcalc">${potOptions(moveFrom,d)}</select></div></div>
-      <div class="row"><label for="m-to">To</label>
-        <div class="money"><select id="m-to" class="sel pcalc">${potOptions(moveTo,d)}</select></div></div>
-      <div class="row"><label for="m-amt">How much</label>
-        <div class="money"><span>$</span><input id="m-amt" class="in pcalc" inputmode="decimal" placeholder="0" value="${pre}"></div></div>`
-    : `
-      <div class="row"><label for="p-amt">Money in</label>
-        <div class="money"><span>$</span><input id="p-amt" class="in pcalc" inputmode="decimal" placeholder="0"></div></div>
-      <div class="row indent"><label for="p-sav">of that, into savings</label>
-        <div class="money"><span>$</span><input id="p-sav" class="in pcalc" inputmode="decimal" placeholder="0"></div></div>
-      ${ S.holdings.map(h=>`<div class="row indent">
-          <label for="p-h-${h.id}">of that, into ${esc(h.name)}</label>
-          <div class="money"><span>$</span><input id="p-h-${h.id}" class="in pcalc hput" data-hid="${h.id}"
-            inputmode="decimal" placeholder="0"></div></div>`).join("") }
-      <div class="row indent"><label for="p-rent">of that, into the rent pot</label>
-        <div class="money"><span>$</span><input id="p-rent" class="in pcalc" inputmode="decimal" placeholder="0"></div></div>`}
-    <div class="split">
-      <div class="splitline"><span>Towards the goal</span><b class="num" id="p-goal">${money(0)}</b></div>
-      <div class="splitline" id="p-rent-line" hidden><span>Into the rent pot</span>
-        <b class="num" id="p-rentd">${money(0)}</b></div>
-      <div class="splitline big"><span>${moveMode?"Change to spending money":"Left to spend"}</span>
-        <b class="num" id="p-left">${money(0)}</b></div>
-    </div>
-    <button class="btn" data-act="${moveMode?"save-move":"save-pay"}">${moveMode?"Move it":"Save"}</button>
-    <button class="link" data-act="move-mode">${moveMode?"Back to recording pay":"Move money between savings, investments and spending"}</button>
-    ${ moveMode?`<p class="note">Moving into spending money doesn't count as spending. Log what you actually buy on the
-      Spending tab as usual. Moving into the rent pot puts it out of reach of both the goal and your spending
-      money &mdash; pay it out on the Rent tab.</p>`
-      :`<p class="note">The rent pot is kept apart: what goes in there isn't part of the goal and isn't money
-        you've got left to spend.</p>`}
+    <div class="big" style="padding-top:0"><span class="k">Pay pot</span><span class="v num">${money(d.toSort,true)}</span></div>
+    <p class="sub">Every pay lands here whole. It isn't in the goal or in left to spend until you move it out
+      below &mdash; as much or as little at a time as you like.</p>
+    <div class="row"><label for="p-amt">Pay came in</label>
+      <div class="money"><span>$</span><input id="p-amt" class="in" inputmode="decimal" placeholder="0"></div></div>
+    <div class="row"><label for="p-date">On</label>
+      <div class="money"><input id="p-date" class="in plain" type="date" value="${lastPayday()}"></div></div>
+    <button class="btn ghost" data-act="save-pay">Put it in the Pay pot</button>
+  </div>
+
+  <div class="card" id="move-card">
+    <h2>Move money</h2>
+    <p class="sub">From any place to any other. It's the same money somewhere else, so your total never changes.</p>
+    <div class="row"><label for="m-from">From</label>
+      <div class="money" style="width:190px"><select id="m-from" class="sel pcalc">${potOptions(moveFrom,d)}</select></div></div>
+    <div class="row"><label for="m-to">To</label>
+      <div class="money" style="width:190px"><select id="m-to" class="sel pcalc">${potOptions(moveTo,d)}</select></div></div>
+    <div class="row"><label for="m-amt">How much</label>
+      <div class="money"><span>$</span><input id="m-amt" class="in pcalc" inputmode="decimal" placeholder="0" value="${pre}"></div></div>
+    <div style="text-align:right"><button class="link" data-act="move-all" id="m-all"></button></div>
+    <div class="row"><label for="m-date">When</label>
+      <div class="money"><input id="m-date" class="in plain" type="date" value="${today()}"></div></div>
+    <div class="split" id="m-sum"></div>
+    <button class="btn" data-act="save-move">Move it</button>
+    <p class="note">Moving into spending money isn't spending &mdash; log what you buy on the Spending tab. The rent pot
+      is out of reach of the goal and your spending money; pay rent out of it on the Rent tab.</p>
     ${ S.income.length?`<button class="link" data-act="tab" data-tab="history">See every pay and move in History</button>`:""}
   </div>`;
 }
@@ -881,7 +1000,11 @@ function viewSpend(d){
     <div class="row"><label for="s-amt">How much</label>
       <div class="money"><span>$</span><input id="s-amt" class="in" inputmode="decimal" placeholder="0.00"></div></div>
     <div style="padding:7px 0"><input id="s-what" class="txt" placeholder="What was it for" aria-label="What was it for"></div>
-    <div class="chips" id="s-cats">${S.categories.map((c,i)=>`<button class="chip" data-act="pick-cat" data-id="${c.id}" aria-pressed="${i===0}"><span class="sw" style="background:${c.color}"></span>${esc(c.name)}</button>`).join("")}</div>
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:6px">
+      <span class="subtle">Category</span>
+      <button class="link" data-act="edit-cats" aria-expanded="${editCats}">${editCats?"Done editing":"Edit categories"}</button></div>
+    <div class="chips" id="s-cats" style="margin-top:4px">${S.categories.map((c,i)=>`<button class="chip" data-act="pick-cat" data-id="${c.id}" aria-pressed="${i===0}"><span class="sw" style="background:${c.color}"></span>${esc(c.name)}</button>`).join("")}</div>
+    ${editCats?`<div style="border-top:1px solid #eef1f2;margin-top:12px;padding-top:12px">${catEditor()}</div>`:""}
     <div class="row" style="margin-top:8px"><label for="s-date">When</label>
       <div class="money"><input id="s-date" class="in plain" type="date" value="${today()}"></div></div>
     <button class="link" data-act="receipt-mode" id="rc-toggle">${receiptMode
@@ -1028,7 +1151,8 @@ function regularsBlock(){
         <option value="monthly" selected>Every month</option></select></div></div>
     <div class="row"><label for="r-next">Next one due</label>
       <div class="money"><input id="r-next" class="in plain" type="date" value="${today()}"></div></div>
-    <div class="chips" id="r-cats">${S.categories.map(c=>`<button class="chip" data-act="pick-rcat" data-id="${c.id}" aria-pressed="${c.id==="bills"}"><span class="sw" style="background:${c.color}"></span>${esc(c.name)}</button>`).join("")}</div>
+    <div class="chips" id="r-cats">${S.categories.map(c=>`<button class="chip" data-act="pick-rcat" data-id="${c.id}" aria-pressed="${
+      c.id===(S.categories.some(x=>x.id==="bills")?"bills":"other")}"><span class="sw" style="background:${c.color}"></span>${esc(c.name)}</button>`).join("")}</div>
     <div class="chips" style="margin-top:2px">
       <button class="chip" id="r-rent" data-act="rec-rent" aria-pressed="false">Pay this from the rent pot</button>
     </div>
@@ -1053,7 +1177,7 @@ function rentEvents(){
   S.income.forEach(i=>{ const r=rentOf(i); if(!r) return;
     const fromPay=i.amount>0;
     out.push({id:i.id, date:i.date, amount:r,
-      what: fromPay?(i.opening?"Opening balance":"Set aside out of your pay"):(i.moveLabel||"Moved across"),
+      what: fromPay?(i.opening?"Opening balance":"Set aside out of your pay"):moveText(i),
       meta: fromPay?"from a pay":"moved between pots",
       del: fromPay?null:"del-pay"}); });
   S.rentPaid.forEach(r=>out.push({id:r.id, date:r.date, amount:-r.amount,
@@ -1112,49 +1236,93 @@ function viewRent(d){
 }
 
 /* ---------- goal ---------- */
+/* Put in, worth now, and the difference. Worth now for a holding is its carried-forward
+   value (rule 2), so paying in never reads as a loss. */
+function stats(put,worth){
+  const g=Math.round((worth-put)*100)/100, cls=g>=0?"up":"down";
+  const pc=put>0.005?g/put*100:null;
+  return `<div class="stats">
+    <div class="stat"><span class="k">Put in</span><span class="v num">${money(put)}</span></div>
+    <div class="stat"><span class="k">Worth now</span><span class="v num">${money(worth)}</span></div>
+    <div class="stat"><span class="k">Up or down</span><span class="v num ${cls}">${g>=0?"+":"−"}${money(Math.abs(g))}</span>
+      ${pc===null?"":`<span class="pc num ${cls}">${pc>=0?"+":"−"}${Math.abs(pc).toFixed(1)}%</span>`}</div>
+  </div>`;
+}
+
+/* Every amount that went in or out of one place, newest first, read straight off the
+   pays and moves already recorded, so it reaches back to the first entry. The other side
+   of a move is whichever place carries the opposite sign, spending money included. */
+function flowsFor(key){
+  const out=[];
+  S.income.forEach(i=>{
+    const sides=sidesOf(i), mine=sides.find(x=>x[0]===key); if(!mine) return;
+    const amt=mine[1];
+    let what;
+    if(i.amount>0) what=i.opening?"Opening balance":"From your pay";
+    else{
+      const o=sides.find(x=>x[0]!==key&&(x[1]>0)!==(amt>0));
+      what=(amt>0?"From ":"To ")+potLabel(o?o[0]:"spend")+(i.closing&&i.closing!==key?", closing "+potLabel(i.closing):"");
+    }
+    out.push({date:i.date, amount:amt, what, n:out.length});
+  });
+  /* Savings also moves when someone pays him back or he corrects the balance, and the list
+     has to add up to the balance shown above it. */
+  if(key==="save"){
+    S.repayments.forEach(r=>out.push({date:r.date, amount:r.amount, what:"Paid back by "+r.who, n:out.length}));
+    S.adjustments.forEach(a=>out.push({date:a.date, amount:a.amount, what:"Correction"+(a.note?": "+a.note:""), n:out.length}));
+  }
+  else{ const h=S.holdings.find(x=>x.id===key);
+    if(h&&h.before) out.push({date:"", amount:h.before, what:"Put in before you used this app", n:-1}); }
+  /* Two on the same day: the one recorded later is the newer one. */
+  return out.sort((a,b)=>a.date===b.date?b.n-a.n:(a.date<b.date?1:-1));
+}
+function flowList(rows){
+  if(!rows.length) return `<div class="empty">Nothing moved in or out yet.</div>`;
+  return `<div style="margin-top:6px">${rows.map(r=>`<div class="exp">
+    <div class="expmain"><div class="expwhat">${esc(r.what)}</div>
+      <div class="expmeta">${r.date?shortDate(r.date)+" "+r.date.slice(0,4):"before the app"}</div></div>
+    <div class="expamt num ${r.amount<0?"down":"up"}">${r.amount<0?"−":"+"}${money(Math.abs(r.amount),true)}</div>
+  </div>`).join("")}</div>`;
+}
+/* The tappable top of a card: the name, then its figures. */
+function holdTop(key,name,figures){
+  const open=!!openRows["flow-"+key];
+  return `<button class="holdtap" data-act="toggle-row" data-id="flow-${key}" aria-expanded="${open}">
+      <div class="holdhead"><span class="holdname">${esc(name)}</span>
+        <span class="subtle">${open?"Hide moves &#9662;":"Moves in and out &#9656;"}</span></div>
+      ${figures}
+    </button>
+    ${open?flowList(flowsFor(key)):""}`;
+}
+
 function viewGoal(d){
   return `<div class="card">
     <h2>What's in the goal</h2>
     <p class="sub">Savings and investments. Spending money never counts.</p>
-    <div class="big" style="border-bottom:1px solid #eef1f2"><span class="k">Savings</span><span class="v num">${money(d.savings)}</span></div>
-    <div class="row" style="border-bottom:0;padding-top:2px"><label for="sav-real">Actually in the account</label>
-      <div class="money"><span>$</span><input id="sav-real" class="in" inputmode="decimal"
-        placeholder="${d.savings.toFixed(2)}"></div></div>
-    <button class="btn ghost" data-act="fix-savings" style="margin-top:6px">Correct the savings balance</button>
-    <p class="note">A fee, some interest, a transfer you forgot &mdash; put in the real figure and it records the
-      difference, so nothing already entered is lost.${d.adjusted?" Corrections so far: "+
-        (d.adjusted>0?"+":"")+money(d.adjusted,true)+".":""} A correction isn't money you put away, so it stays out
-      of the weekly bars.</p>
-    <div class="big" style="border-top:1px solid #eef1f2;margin-top:10px"><span class="k">Investments, worth today</span><span class="v num">${money(d.investVal)}</span></div>
-    <div class="split">
-      <div class="splitline"><span>Of your savings, paid back to you</span><b class="num">${money(d.repaid)}</b></div>
-      <div class="splitline"><span>Put into investments</span><b class="num">${money(d.invested)}</b></div>
-      <div class="splitline"><span>Which have ${d.growth>=0?"gained":"lost"}</span>
-        <b class="num ${d.growth>=0?"up":"down"}">${d.growth>=0?"+":""}${money(d.growth)}</b></div>
-      <div class="splitline big"><span>Total towards the goal</span><b class="num">${money(d.goalTotal)}</b></div>
-    </div>
+    <div class="hold" style="padding-top:4px">${holdTop("save","Savings",
+      /* Savings doesn't rise or fall in value, so it's just the balance. */
+      `<div class="stats"><div class="stat"><span class="k">Balance</span><span class="v num">${money(d.savings,true)}</span></div></div>`)}</div>
+    <button class="link" data-act="fix-savings">The real figure is different, fix it</button>
   </div>
 
   <div class="card">
     <h2>Your investments</h2>
-    <p class="sub">Each one on its own. Type what it's worth today and hit save &mdash; you can do one or all of them.</p>
-    ${ d.holdings.length===0?`<div class="empty">None set up. Add them under Setup.</div>`
-      : d.holdings.map(x=>{
+    <p class="sub">Each one on its own. Tap one to see every amount moved in or out. Type what it's worth today
+      and hit save &mdash; you can do one or all of them.</p>
+    ${ d.open.length===0?`<div class="empty">None set up. Add them under Setup.</div>`
+      : d.open.map(x=>{
         const lo=Math.min.apply(null,x.hist), hi=Math.max.apply(null,x.hist);
         return `<div class="hold">
-          <div class="holdhead">
-            <span class="holdname">${esc(x.h.name)}</span>
-            <span class="holdval num">${money(x.value)}</span>
-            <span class="holdchg num ${x.growth>=0?"up":"down"}">${x.growth>=0?"+":""}${money(x.growth)}</span>
-          </div>
+          ${holdTop(x.h.id,x.h.name,stats(x.put,x.value))}
           ${ x.hist.length>1?`<div class="spark">${x.hist.slice(-10).map((v,i,a)=>`<div class="${i===a.length-1?"last":""}" style="height:${hi===lo?50:8+((v-lo)/(hi-lo))*92}%"></div>`).join("")}</div>`:""}
-          <div class="expmeta">Put in ${money(x.put)}${x.lastAt?" &middot; valued "+shortDate(x.lastAt):" &middot; never valued, assuming it's worth what went in"}</div>
+          <div class="expmeta">${x.lastAt?"Worth now is your value from "+shortDate(x.lastAt)+", plus or minus anything moved since"
+            :"Never valued, so it's taken to be worth what went in"}</div>
           <div class="row" style="border-bottom:0;padding-bottom:0">
             <label for="v-${x.h.id}">Worth today</label>
             <div class="money"><span>$</span><input id="v-${x.h.id}" class="in vput" data-hid="${x.h.id}"
               inputmode="decimal" placeholder="${x.value.toFixed(2)}"></div></div>
         </div>`;}).join("") }
-    ${ d.holdings.length?`<div class="row"><label for="v-date">As at</label>
+    ${ d.open.length?`<div class="row"><label for="v-date">As at</label>
         <div class="money"><input id="v-date" class="in plain" type="date" value="${today()}"></div></div>
       <button class="btn" data-act="save-values">Save values</button>
       <p class="note">Leave one blank and it keeps its last value.</p>`:""}
@@ -1215,15 +1383,15 @@ const HCOL={in:"#176b5c",out:"#b23f2a",move:"#4a6d8c",inv:"#8a6bbf",rent:"#a0713
 function events(){
   const out=[];
   S.income.forEach(i=>{
-    const inv=investOf(i);
-    const rnt=rentOf(i);
+    /* A pay since v5 goes whole into the Pay pot; an older one was split on the spot, and
+       says where each part went. */
+    const parts=sidesOf(i);
     if(i.amount>0) out.push({id:i.id,del:"del-pay",type:"in",date:i.date,amount:i.amount,
       what:i.opening?"Opening balance":"Pay",
-      detail:money(i.toSavings,true)+" to savings \u00b7 "+money(inv,true)+" invested \u00b7 "+
-        (rnt?money(rnt,true)+" to rent \u00b7 ":"")+
-        money(i.amount-i.toSavings-inv-rnt,true)+" to spend"});
+      detail:parts.length===1&&parts[0][0]==="sort"?"Into the Pay pot. Move it on from the Pay tab."
+        :parts.map(x=>money(x[1],true)+" to "+potLabel(x[0])).join(" \u00b7 ")});
     else out.push({id:i.id,del:"del-pay",type:"move",date:i.date,amount:null,
-      what:i.moveLabel||"Moved across",
+      what:moveText(i),
       detail:"Money changed pots. Nothing came in and nothing was spent."});
   });
   S.expenses.forEach(e=>out.push({id:e.id,del:"del-exp",type:"out",date:e.date,amount:-e.amount,
@@ -1328,7 +1496,81 @@ function persistLine(){
 }
 
 /* ---------- setup ---------- */
+/* ---------- spending categories ----------
+   One editor, shown in Setup and opened from the Spending tab. Each change saves as it's
+   made, so there's no Save button to miss. Expenses hold only a category's id, so a rename
+   shows on every past expense at once. */
+function catEditor(){
+  return `<p class="sub">Type over a name to rename it &mdash; every past expense follows. Removing one moves its
+      expenses to ${esc(catOf("other").name)}.</p>
+    <div id="set-cats">${S.categories.map(c=>{ const locked=LOCKED_CATS.indexOf(c.id)>-1;
+      return `<div class="line" data-id="${c.id}">
+      <span class="sw" style="background:${c.color}"></span>
+      <input class="nm cat-name" data-id="${c.id}" value="${esc(c.name)}" aria-label="Category name"${
+        locked?' readonly style="color:var(--ink-2)"':""}>
+      ${locked?`<span class="lock">locked</span>`
+        :`<button class="x" data-act="del-cat" data-id="${c.id}" aria-label="Remove ${esc(c.name)}">&times;</button>`}</div>`;}).join("")}</div>
+    <div class="line" style="margin-top:12px">
+      <input class="nm" id="cat-new" placeholder="New category" aria-label="New category">
+      <button class="mini solid" data-act="add-cat">Add</button></div>
+    <p class="note">${esc(catOf("work").name)} and ${esc(catOf("other").name)} are locked: claimable spending and GST
+      are worked out from the first, and the second is where expenses go when their category is removed.</p>`;
+}
+/* A re-render after a category change mustn't take a half-typed expense with it. */
+function renderKeeping(){
+  const ids=["s-amt","s-what","s-date","s-sup","s-gst"], kept={};
+  ids.forEach(id=>{ const el=document.getElementById(id); if(el) kept[id]=el.value; });
+  const chip=document.querySelector('#s-cats .chip[aria-pressed="true"]'), cat=chip&&chip.dataset.id;
+  render();
+  ids.forEach(id=>{ const el=document.getElementById(id); if(el&&kept[id]!==undefined) el.value=kept[id]; });
+  if(cat&&document.querySelector('#s-cats .chip[data-id="'+cat+'"]'))
+    document.querySelectorAll("#s-cats .chip").forEach(c=>c.setAttribute("aria-pressed",String(c.dataset.id===cat)));
+  updateGst();
+}
+function renameCat(id,name){
+  const c=S.categories.find(x=>x.id===id); if(!c||LOCKED_CATS.indexOf(id)>-1) return;
+  name=name.trim();
+  /* Blanking a name isn't removing it — that's what the cross is for, with its warning. */
+  if(!name){ renderKeeping(); toast("A category needs a name. Use the \u00d7 to remove it."); return; }
+  if(name===c.name) return;
+  c.name=name; save(); renderKeeping(); toast("Renamed to \u201c"+name+"\u201d");
+}
+
+/* Closing a holding that still has money in it would either take that money out of his
+   total or leave it counted where he can't see it, so it has to be moved out first. */
+function closingPanel(d){
+  const x=closingId&&d.holdings.find(y=>y.h.id===closingId); if(!x) return "";
+  const nm=esc(x.h.name);
+  return `<div class="flag" style="margin-bottom:8px">${nm} is still worth ${money(x.value,true)}${
+      x.lastAt?" (your value from "+shortDate(x.lastAt)+", plus anything moved since)":""}.
+    Closing it with that in it would take it out of your total, so move it somewhere first. If that figure is
+    out of date, put in today's value on the Goal tab before closing.
+    <button class="btn" data-act="close-move" data-to="save">Move it to savings and close ${nm}</button>
+    <button class="btn ghost" data-act="close-move" data-to="sort">Move it to the Pay pot and close ${nm}</button>
+    <button class="link" data-act="close-cancel">Keep ${nm} open</button>
+  </div>`;
+}
+function closedList(d){
+  const shut=d.holdings.filter(x=>x.h.closed); if(!shut.length) return "";
+  return `<div><button class="link" data-act="show-closed">${showClosed?"Hide":"Show"} closed investments (${shut.length})</button>
+    ${showClosed?shut.map(x=>{ const nm=esc(x.h.name);
+      return `<div class="exp">
+        <div class="expmain"><div class="expwhat">${nm}</div>
+          <div class="expmeta">closed ${shortDate(x.h.closed)}${Math.abs(x.value)>=0.005
+            ?" &middot; still counted at "+money(x.value):" &middot; past figures still counted"}</div></div>
+        <button class="mini" data-act="reopen-hold" data-id="${x.h.id}">Reopen</button>
+        <button class="mini" data-act="ask-purge" data-id="${x.h.id}">Delete</button>
+      </div>
+      ${purgeId===x.h.id?`<p class="note">Deleting ${nm} permanently takes it out of every week it was ever in:
+          each pay that put money into it is recorded as if that part never came in, and every move to or from it
+          is removed, so the money goes back where it came from. <strong>Your past weekly totals and your goal
+          total will change.</strong></p>
+        <button class="btn danger" data-act="purge-hold" data-id="${x.h.id}">Yes, delete ${nm} permanently</button>
+        <button class="btn ghost" data-act="cancel-purge">Keep it</button>`:""}`;}).join(""):""}</div>`;
+}
+
 function viewSetup(){
+  const d=derive();
   const pYears=photoYears();
   if(photoFY!=="all"&&pYears.indexOf(+photoFY)<0) photoFY="all";
   return `<div class="card">
@@ -1341,17 +1583,18 @@ function viewSetup(){
         ${DAYS.map((d,i)=>`<option value="${i}"${i===payDay()?" selected":""}>${d}</option>`).join("")}</select></div></div>
     <p class="note" style="margin-top:6px">Your spending week runs ${DAYS[payDay()]} to ${DAYS[(payDay()+6)%7]}.</p>
 
-    <p class="sub" style="margin-top:16px;margin-bottom:8px">Investments. Renaming is safe, removing one deletes its history.</p>
-    <div id="set-holds">${S.holdings.map(holdLine).join("")}</div>
+    <p class="sub" style="margin-top:16px;margin-bottom:8px">Investments. Renaming is safe. The box beside each
+      is anything you'd already put in before using this app, if you want it counted in Put in.</p>
+    <div id="set-holds">${S.holdings.filter(h=>!h.closed).map(h=>holdLine(h,true)).join("")}</div>
+    ${closingPanel(d)}
     <button class="link" data-act="add-hold">Add an investment</button>
+    ${closedList(d)}
 
-    <p class="sub" style="margin-top:18px;margin-bottom:8px">Spending categories.</p>
-    <div id="set-cats">${S.categories.map(c=>`<div class="line" data-id="${c.id}">
-      <span class="sw" style="background:${c.color}"></span>
-      <input class="nm cat-name" value="${esc(c.name)}" aria-label="Category name">
-      <button class="x" data-act="del-cat" aria-label="Remove">&times;</button></div>`).join("")}</div>
-    <button class="link" data-act="add-cat">Add a category</button>
     <button class="btn" data-act="save-settings">Save changes</button>
+  </div>
+  <div class="card">
+    <h2>Spending categories</h2>
+    ${catEditor()}
   </div>
   <div class="card">
     <h2>Reading receipts</h2>
@@ -1392,46 +1635,49 @@ function viewSetup(){
       :`<p class="note">This deletes everything. It can't be undone.</p>
         <button class="btn danger" data-act="wipe">Yes, delete everything</button>
         <button class="btn ghost" data-act="cancel-wipe">Keep my data</button>`}
-  </div>`;
+  </div>
+  ${ readKey(OLD_KEYS[0])?`<div class="card">
+    <h2>Recover data from before the update</h2>
+    <p class="sub">This phone still has your data as it was before this version. If anything looks wrong
+      since the update, this puts that copy back and brings it up to date again.</p>
+    <button class="btn ghost" data-act="recover-v4">Recover data from before the update</button>
+  </div>`:""}`;
 }
 
-/* ---------- live split on the pay form ---------- */
-function updateSplit(){
-  const g=document.getElementById("p-goal"); if(!g) return;
-  const el=document.getElementById("p-left");
-  /* The rent line only appears when rent is actually in play, so an ordinary pay with
-     nothing set aside for rent reads exactly as it always did. */
-  const showRent=(delta,signed)=>{
-    const row=document.getElementById("p-rent-line"), b=document.getElementById("p-rentd");
-    if(!row||!b) return;
-    row.hidden = delta===0;
-    b.textContent=(signed&&delta>=0?"+":"")+money(delta);
-    b.className="num"+(delta<0?" down":"");
-  };
+/* A move is just an allocation entry with a minus on one side. Spending money is the
+   implied remainder and so needs no term of its own; the rent pot and the Pay pot have
+   one, because each is a balance in its own right rather than what's left over. */
+function moveEntry(from,to,amt,date){
+  const e={id:uid(), date, amount:0, toSavings:0, invest:{}, toRent:0, toSort:0};
+  const put=(id,v)=>{ if(id==="save") e.toSavings+=v; else if(id==="rent") e.toRent+=v;
+    else if(id==="sort") e.toSort+=v; else if(id!=="spend") e.invest[id]=(e.invest[id]||0)+v; };
+  put(from,-amt); put(to,amt);
+  return e;
+}
+/* Every other button that moves money just opens Move money filled in. */
+function goMove(from,to,amt){
+  moveFrom=from; moveTo=to; movePrefill=amt; tab="pay"; spendSub=null; render();
+  const c=document.getElementById("move-card"); if(c) c.scrollIntoView({block:"start"});
+}
 
-  if(moveMode){
-    const from=val("m-from"), to=val("m-to"), amt=num(val("m-amt"));
-    /* Only savings and the holdings are in the goal. Spending money and the rent pot
-       are both outside it, so moving between them leaves the goal alone. */
-    const inGoal=id=>id!=="spend"&&id!=="rent";
-    const part=pot=>(to===pot?amt:0)-(from===pot?amt:0);
-    const goalDelta  = (inGoal(to)?amt:0) - (inGoal(from)?amt:0);
-    g.textContent=(goalDelta>=0?"+":"")+money(goalDelta);
-    g.className="num"+(goalDelta<0?" down":"");
-    showRent(part("rent"),true);
-    const spendDelta=part("spend");
-    el.textContent=(spendDelta>=0?"+":"")+money(spendDelta);
-    el.className="num"+(spendDelta<0?" down":"");
-    return;
-  }
-
-  const amt=num(val("p-amt")), sav=num(val("p-sav")), rnt=num(val("p-rent"));
-  let inv=0; document.querySelectorAll(".hput").forEach(i=>inv+=num(i.value));
-  g.textContent=money(sav+inv); g.className="num";
-  showRent(rnt,false);
-  const left=amt-sav-inv-rnt;
-  el.textContent=money(left);
-  el.className="num"+(left<0?" down":"");
+/* ---------- live summary on the move form ----------
+   Both places before and after, so he can see it's the same money moving, and what the
+   move does to the goal: only savings and the holdings are in it, so a move between two
+   of them, or between two places outside it, leaves the goal alone. */
+function updateMove(){
+  const box=document.getElementById("m-sum"); if(!box) return;
+  const d=derive(), from=val("m-from"), to=val("m-to"), amt=Math.max(0,num(val("m-amt")));
+  const has=balanceOf(from,d), all=document.getElementById("m-all");
+  if(all) all.textContent=has>0.005?"Move all "+money(has,true):"";
+  const inGoal=id=>id!=="spend"&&id!=="rent"&&id!=="sort";
+  const goal=(inGoal(to)?amt:0)-(inGoal(from)?amt:0);
+  const line=(id,after)=>`<div class="splitline"><span>${esc(potLabel(id))}</span><b class="num${after<-0.005?" down":""}">${
+    money(balanceOf(id,d),true)} &rarr; ${money(after,true)}</b></div>`;
+  box.innerHTML=from===to?`<div class="splitline"><span>Pick two different places</span></div>`
+    : line(from,balanceOf(from,d)-amt)+line(to,balanceOf(to,d)+amt)+
+      `<div class="splitline big"><span>${goal?"The goal":"Your total"}</span><b class="num${goal<0?" down":""}">${
+        goal?(goal>0?"+":"−")+money(Math.abs(goal),true):"doesn't change"}</b></div>`+
+      (amt>has+0.005?`<p class="note" style="margin:6px 0 0;color:var(--behind)">Only ${money(has,true)} in ${esc(potLabel(from))}.</p>`:"");
 }
 
 function download(name,text,type){
@@ -1543,11 +1789,11 @@ function showPhoto(){
 }
 
 function wire(){
-  document.querySelectorAll(".pcalc").forEach(i=>i.addEventListener("input",updateSplit));
+  document.querySelectorAll(".pcalc").forEach(i=>i.addEventListener("input",updateMove));
   const mf=document.getElementById("m-from"), mt=document.getElementById("m-to");
-  if(mf) mf.addEventListener("change",()=>{ moveFrom=mf.value; });
-  if(mt) mt.addEventListener("change",()=>{ moveTo=mt.value; });
-  updateSplit();
+  if(mf) mf.addEventListener("change",()=>{ moveFrom=mf.value; updateMove(); });
+  if(mt) mt.addEventListener("change",()=>{ moveTo=mt.value; updateMove(); });
+  updateMove();
 
   const sa=document.getElementById("s-amt"), sg=document.getElementById("s-gst");
   if(sa) sa.addEventListener("input",()=>{ unmark("s-amt"); updateGst(); });
@@ -1573,6 +1819,12 @@ function wire(){
   };
   ["rc-file","rc-pick"].forEach(id=>{ const el=document.getElementById(id);
     if(el) el.addEventListener("change",takePhotos); });
+
+  document.querySelectorAll(".cat-name:not([readonly])").forEach(el=>
+    el.addEventListener("change",()=>renameCat(el.dataset.id,el.value)));
+  const cn=document.getElementById("cat-new");
+  if(cn) cn.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault();
+    const b=document.querySelector('[data-act="add-cat"]'); if(b) b.click(); } });
 
   const hs=document.getElementById("h-search");
   if(hs) hs.addEventListener("input",()=>{ histSearch=hs.value;
@@ -1618,14 +1870,74 @@ const photoYears=()=>{ const y=[]; photosIn("all").forEach(e=>{ const f=fyOf(e.d
   if(y.indexOf(f)<0) y.push(f); }); return y.sort().reverse(); };
 
 function readHoldLines(sel){
-  return Array.prototype.map.call(document.querySelectorAll(sel+" .line"),el=>({
-    id:el.dataset.id, name:el.querySelector(".hold-name").value.trim()
-  })).filter(h=>h.name);
+  return Array.prototype.map.call(document.querySelectorAll(sel+" .line"),el=>{
+    const h={id:el.dataset.id, name:el.querySelector(".hold-name").value.trim()};
+    const b=el.querySelector(".hold-before"), before=b?Math.round(num(b.value)*100)/100:0;
+    if(before) h.before=before;
+    return h;
+  }).filter(h=>h.name);
 }
+
+/* What the Setup form says, saved. Closed holdings aren't in the form, so they're kept as
+   they were. Categories aren't part of it: their editor saves each change as it's made. */
+function applySettings(){
+  S.goal=num(val("g-goal")); S.deadline=val("g-date");
+  S.payDay=parseInt(val("g-payday"),10)||0;
+  const open=readHoldLines("#set-holds").map(h=>{
+    const old=S.holdings.find(x=>x.id===h.id), was=Object.assign({},old||{},h);
+    if(!h.before) delete was.before;
+    return was; });
+  /* A line only has a cross once nothing is recorded against it, so this drops nothing
+     but an unused name. */
+  S.holdings=open.concat(S.holdings.filter(h=>h.closed));
+  const keep={}; S.holdings.forEach(h=>keep[h.id]=1);
+  S.investValues=S.investValues.filter(v=>keep[v.hid]);
+}
+
+/* Deleting a holding for good, as if it had never been set up: the part of each pay that
+   went into it is taken off that pay, and every move to or from it is removed, so the
+   money on the other side of a move goes back to where it was. */
+function purgeHolding(id){
+  S.holdings=S.holdings.filter(h=>h.id!==id);
+  S.investValues=S.investValues.filter(v=>v.hid!==id);
+  S.income=S.income.filter(i=>{
+    const m=i.invest||{}; if(!(id in m)) return true;
+    if(!(i.amount>0)) return false;
+    i.amount=Math.round((i.amount-m[id])*100)/100;
+    i.invest=Object.assign({},m); delete i.invest[id];
+    return i.amount>0;
+  });
+}
+
+/* What each delete button removes, and the question asked before it does. */
+const DELS={
+  "del-exp":     {list:"expenses", ask:e=>"Delete “"+e.what+"”, "+money(e.amount,true)+" on "+shortDate(e.date)+"?"},
+  "del-pay":     {list:"income", ask:i=>i.amount>0
+    ? "Delete the "+(i.opening?"opening balance":"pay")+" of "+money(i.amount,true)+" on "+shortDate(i.date)+
+      "? Everything it put in "+(sidesOf(i).length===1&&sortOf(i)?"the Pay pot":"each place")+" comes out again."
+    : "Delete “"+moveText(i)+"” on "+shortDate(i.date)+"? The money goes back where it came from."},
+  "del-rec":     {list:"recurring", ask:r=>"Delete the regular bill “"+r.name+"”? Ones already ticked off stay where they are."},
+  "del-rentpaid":{list:"rentPaid", ask:r=>"Delete “"+(r.what||"Rent paid")+"”, "+money(r.amount,true)+"? It goes back into the rent pot."},
+  "del-rentadj": {list:"rentAdjustments", ask:()=>"Delete this rent pot correction?"},
+  "del-adj":     {list:"adjustments", ask:()=>"Delete this savings correction?"},
+  "del-val":     {list:"investValues", ask:()=>"Delete this value? Worth now goes back to the one before it."},
+  "del-repaid":  {list:"repayments", ask:r=>"Delete "+r.who+"'s repayment of "+money(r.amount,true)+"?"},
+  "del-owed":    {list:"owed", ask:o=>"Take "+o.who+" off the list of people who owe you?"}
+};
 
 document.getElementById("app").addEventListener("click",e=>{
   const btn=e.target.closest("[data-act]"); if(!btn) return;
   const act=btn.dataset.act;
+
+  if(DELS[act]){
+    const k=DELS[act], id=btn.dataset.id, item=S[k.list].find(x=>x.id===id); if(!item) return;
+    if(!confirm(k.ask(item))) return;
+    /* A receipt photo can't come back once it's gone, so it waits until the undo has lapsed. */
+    const after=act==="del-exp"&&item.photo?()=>{ photoDel(id).catch(()=>{});
+      if(photoUrls[id]){ URL.revokeObjectURL(photoUrls[id]); delete photoUrls[id]; } }:null;
+    removeWithUndo("Deleted",()=>{ S[k.list]=S[k.list].filter(x=>x.id!==id); },after);
+    return;
+  }
 
   if(act==="setup-add-hold"||act==="add-hold"){
     document.getElementById(act==="setup-add-hold"?"setup-holds":"set-holds")
@@ -1633,11 +1945,42 @@ document.getElementById("app").addEventListener("click",e=>{
     return;
   }
   if(act==="del-hold"){ btn.closest(".line").remove(); return; }
+  if(act==="close-hold"){
+    applySettings();                       // keep anything typed in the form before re-rendering
+    const id=btn.dataset.id, x=derive().holdings.find(y=>y.h.id===id); if(!x) return;
+    if(Math.abs(x.value)>=0.005){ closingId=id; save(); render(); return; }
+    x.h.closed=today(); closingId=null; save(); render();
+    toast(x.h.name+" closed. Its past stays in your totals."); return;
+  }
+  if(act==="close-move"){
+    const x=derive().holdings.find(y=>y.h.id===closingId); if(!x){ closingId=null; render(); return; }
+    const to=btn.dataset.to, amt=Math.round(x.value*100)/100;
+    /* An ordinary move, so the total can't change: the holding goes to nothing and the
+       same amount lands in savings or the Pay pot. Its gain or loss stays as it was. */
+    const entry=moveEntry(x.h.id,to,amt,today()); entry.closing=x.h.id;
+    S.income.push(entry);
+    x.h.closed=today(); closingId=null; save(); render();
+    toast(moveText(entry)); return;
+  }
+  if(act==="close-cancel"){ closingId=null; render(); return; }
+  if(act==="show-closed"){ showClosed=!showClosed; purgeId=null; render(); return; }
+  if(act==="reopen-hold"){
+    const h=S.holdings.find(x=>x.id===btn.dataset.id); if(!h) return;
+    applySettings(); delete h.closed; save(); render(); toast(h.name+" is open again"); return;
+  }
+  if(act==="ask-purge"){ purgeId=btn.dataset.id; render(); return; }
+  if(act==="cancel-purge"){ purgeId=null; render(); return; }
+  if(act==="purge-hold"){
+    const id=btn.dataset.id, h=S.holdings.find(x=>x.id===id); if(!h) return;
+    purgeId=null;
+    removeWithUndo(h.name+" deleted",()=>purgeHolding(id));
+    return;
+  }
 
   if(act==="start"){
     const sav=num(val("u-sav")), wal=num(val("u-wal")), rnt=num(val("u-rent"));
     S={goal:num(val("u-goal")), deadline:val("u-date"), payDay:parseInt(val("u-payday"),10)||0,
-       readReceipts:true, categories:DEFAULT_CATS, holdings:readHoldLines("#setup-holds"),
+       readReceipts:true, categories:DEFAULT_CATS.map(c=>Object.assign({},c)), holdings:readHoldLines("#setup-holds"),
        income:[], expenses:[], recurring:[], owed:[], repayments:[], investValues:[], adjustments:[],
        rentPaid:[], rentAdjustments:[]};
     /* One opening entry covers all three: spending money is the remainder, so it needs no
@@ -1649,58 +1992,44 @@ document.getElementById("app").addEventListener("click",e=>{
     if(S.holdings.length) toast("Now put in what each investment is worth");
     return;
   }
-  if(act==="tab"){ tab=btn.dataset.tab; moveMode=false; movePrefill=null; spendSub=null;
+  if(act==="tab"){ tab=btn.dataset.tab; movePrefill=null; spendSub=null; editCats=false;
+    closingId=null; purgeId=null;
     openRows={}; render();
     /* Existing saves never got asked at setup, so ask the first time he opens the tab
        where the answer is shown. Already answered, this only re-reads the status. */
     if(tab==="setup") checkPersist(S.persisted===undefined);
     return; }
-  if(act==="move-mode"){ moveMode=!moveMode; if(!moveMode) movePrefill=null; render(); return; }
   if(act==="sweep"){
-    const d=derive();
-    movePrefill=Math.max(0,d.safe); moveFrom="spend"; moveTo="save"; moveMode=true; tab="pay"; render();
+    goMove("spend","save",Math.max(0,derive().safe));
     toast("Change the amount if you don't want all of it"); return;
+  }
+  if(act==="move-all"){
+    const d=derive(), a=document.getElementById("m-amt");
+    if(a){ a.value=Math.max(0,balanceOf(val("m-from"),d)).toFixed(2); updateMove(); } return;
   }
 
   if(act==="save-move"){
-    const d=derive(), from=val("m-from"), to=val("m-to"), amt=num(val("m-amt"));
+    const d=derive(), from=val("m-from"), to=val("m-to"), amt=Math.round(num(val("m-amt"))*100)/100;
     if(amt<=0){ toast("How much?"); return; }
     if(from===to){ toast("Pick two different places"); return; }
-
-    const nameOf=id=>id==="spend"?"Spending":id==="save"?"Savings":id==="rent"?"Rent":
-      ((S.holdings.find(h=>h.id===id)||{}).name||"Investment");
-    const availableIn=id=>id==="spend"?d.safe:id==="save"?d.savings:id==="rent"?d.rent:
-      ((d.holdings.find(x=>x.h.id===id)||{}).value||0);
-    if(amt>availableIn(from)+0.005){
-      toast("Only "+money(availableIn(from))+" in "+nameOf(from)); return; }
-
-    /* A move is just an allocation entry with a minus on one side. Spending money is the
-       implied remainder and so needs no term of its own; the rent pot has one, because it
-       is a balance in its own right rather than what's left over. */
-    const entry={id:uid(), date:val("p-date")||today(), amount:0, toSavings:0, invest:{}, toRent:0,
-      moveLabel:money(amt)+": "+nameOf(from)+" to "+nameOf(to)};
-    if(from==="save") entry.toSavings-=amt;
-    else if(from==="rent") entry.toRent-=amt;
-    else if(from!=="spend") entry.invest[from]=(entry.invest[from]||0)-amt;
-    if(to==="save") entry.toSavings+=amt;
-    else if(to==="rent") entry.toRent+=amt;
-    else if(to!=="spend") entry.invest[to]=(entry.invest[to]||0)+amt;
-
+    /* Nothing can go below zero: the Pay pot, the rent pot, savings, spending money or a
+       holding. Say what's actually there rather than quietly going negative. */
+    if(amt>balanceOf(from,d)+0.005){
+      toast("Only "+money(balanceOf(from,d),true)+" in "+potLabel(from)); return; }
+    const entry=moveEntry(from,to,amt,val("m-date")||today());
     S.income.push(entry);
-    save(); moveMode=false; movePrefill=null; render();
-    toast(nameOf(from)+" to "+nameOf(to)); return;
+    /* Emptying the Pay pot usually takes several goes, so keep it as the place to move from. */
+    moveFrom=from; moveTo=to; movePrefill=null;
+    save(); render(); toast(moveText(entry)); return;
   }
   if(act==="save-pay"){
-    const sav=num(val("p-sav")), amt=num(val("p-amt")), rnt=num(val("p-rent"));
-    const invest={}; let inv=0;
-    document.querySelectorAll(".hput").forEach(i=>{
-      const v=num(i.value); if(v){ invest[i.dataset.hid]=v; inv+=v; } });
-    if(!amt&&!sav&&!inv&&!rnt){ toast("Nothing to save yet"); return; }
-    if(sav+inv+rnt>amt){ toast("You're setting aside more than came in"); return; }
-    S.income.push({id:uid(), date:val("p-date")||today(), amount:amt, toSavings:sav, invest:invest, toRent:rnt});
-    save(); render(); toast("Saved"); return;
+    const amt=Math.round(num(val("p-amt"))*100)/100;
+    if(amt<=0){ toast("How much came in?"); return; }
+    /* All of it into the Pay pot. Spending money is still the implied remainder, which for
+       a pay is now nothing: every dollar of it is in `toSort`. */
+    S.income.push({id:uid(), date:val("p-date")||lastPayday(), amount:amt, toSavings:0, invest:{}, toRent:0, toSort:amt});
+    moveFrom="sort"; save(); render(); toast(money(amt,true)+" into the Pay pot"); return;
   }
-  if(act==="del-pay"){ S.income=S.income.filter(i=>i.id!==btn.dataset.id); save(); render(); return; }
 
   if(act==="receipt-mode"){
     receiptMode=!receiptMode;
@@ -1779,11 +2108,6 @@ document.getElementById("app").addEventListener("click",e=>{
     }else done(receiptMode?"Receipt saved":"Added");
     return;
   }
-  if(act==="del-exp"){
-    const gone=S.expenses.find(x=>x.id===btn.dataset.id);
-    if(gone&&gone.photo){ photoDel(gone.id).catch(()=>{});
-      if(photoUrls[gone.id]){ URL.revokeObjectURL(photoUrls[gone.id]); delete photoUrls[gone.id]; } }
-    S.expenses=S.expenses.filter(x=>x.id!==btn.dataset.id); save(); render(); return; }
   if(act==="again-exp"){ const e2=S.expenses.find(x=>x.id===btn.dataset.id);
     /* Same shop, same amount, today — but its own receipt, so the photo doesn't come along. */
     if(e2){ const copy=Object.assign({},e2,{id:uid(),date:today()});
@@ -1834,12 +2158,11 @@ document.getElementById("app").addEventListener("click",e=>{
     const p=document.querySelector('#r-cats .chip[aria-pressed="true"]');
     const fr=document.getElementById("r-rent");
     const rec={id:uid(), name:n, amount:a, freq:val("r-freq"),
-      next:val("r-next")||today(), cat:p?p.dataset.id:"bills"};
+      next:val("r-next")||today(), cat:p?p.dataset.id:"other"};
     if(fr&&fr.getAttribute("aria-pressed")==="true") rec.fromRent=true;
     S.recurring.push(rec);
     save(); render(); toast(rec.fromRent?"Bill saved, it comes off the rent pot":"Bill saved"); return;
   }
-  if(act==="del-rec"){ S.recurring=S.recurring.filter(r=>r.id!==btn.dataset.id); save(); render(); return; }
   if(act==="log-due"||act==="skip-due"){
     const item=dueList()[parseInt(btn.dataset.i,10)]; if(!item) return;
     const r=S.recurring.find(x=>x.id===item.r.id);
@@ -1870,8 +2193,9 @@ document.getElementById("app").addEventListener("click",e=>{
   }
 
   if(act==="fix-savings"){
-    const d=derive(), said=val("sav-real");
-    if(said.trim()===""){ toast("Type what's actually in the account"); return; }
+    const d=derive();
+    const said=prompt("How much is actually in your savings account?", d.savings.toFixed(2));
+    if(said===null||said.trim()==="") return;
     const real=num(said), diff=Math.round((real-d.savings)*100)/100;
     if(!diff){ toast("Already matches"); return; }
     /* The delta is stored, never the new total, so the history behind it stays intact
@@ -1889,9 +2213,8 @@ document.getElementById("app").addEventListener("click",e=>{
     S.rentPaid.push({id:uid(), date:val("rp-date")||today(), amount:a, what:"Rent paid"});
     save(); render(); toast(money(a)+" off the rent pot"); return;
   }
-  if(act==="del-rentpaid"){ S.rentPaid=S.rentPaid.filter(r=>r.id!==btn.dataset.id); save(); render(); return; }
   if(act==="move-to-rent"){
-    moveFrom="spend"; moveTo="rent"; moveMode=true; movePrefill=null; tab="pay"; render();
+    goMove(derive().toSort>0.005?"sort":"save","rent",null);
     toast("Where it comes from is up to you"); return;
   }
   if(act==="fix-rent"){
@@ -1909,11 +2232,7 @@ document.getElementById("app").addEventListener("click",e=>{
     save(); render();
     toast(diff>0?money(diff,true)+" added to the rent pot":money(-diff,true)+" taken off the rent pot"); return;
   }
-  if(act==="del-rentadj"){ S.rentAdjustments=S.rentAdjustments.filter(a=>a.id!==btn.dataset.id);
-    save(); render(); return; }
 
-  if(act==="del-adj"){ S.adjustments=S.adjustments.filter(a=>a.id!==btn.dataset.id); save(); render(); return; }
-  if(act==="del-val"){ S.investValues=S.investValues.filter(v=>v.id!==btn.dataset.id); save(); render(); return; }
 
   if(act==="save-values"){
     const date=val("v-date")||today(); let n=0;
@@ -1939,30 +2258,33 @@ document.getElementById("app").addEventListener("click",e=>{
     if(o.amount===0) S.owed=S.owed.filter(x=>x.id!==o.id);
     save(); render(); toast(money(a)+" into savings"); return;
   }
-  if(act==="del-owed"){ S.owed=S.owed.filter(o=>o.id!==btn.dataset.id); save(); render(); return; }
-  if(act==="del-repaid"){ S.repayments=S.repayments.filter(r=>r.id!==btn.dataset.id); save(); render(); return; }
 
-  if(act==="del-cat"){ btn.closest(".line").remove(); return; }
-  if(act==="add-cat"){
-    document.getElementById("set-cats").insertAdjacentHTML("beforeend",
-      `<div class="line" data-id="${uid()}"><span class="sw" style="background:#8c9aa3"></span>
-       <input class="nm cat-name" value="" placeholder="Category name" aria-label="Category name">
-       <button class="x" data-act="del-cat" aria-label="Remove">&times;</button></div>`);
+  if(act==="edit-cats"){ editCats=!editCats; renderKeeping(); return; }
+  if(act==="del-cat"){
+    const id=btn.dataset.id, c=S.categories.find(x=>x.id===id); if(!c||LOCKED_CATS.indexOf(id)>-1) return;
+    const n=S.expenses.filter(x=>x.cat===id).length+S.recurring.filter(r=>r.cat===id).length;
+    const other=catOf("other").name;
+    if(!confirm(n?"\u201c"+c.name+"\u201d is on "+plural(n,"expense or bill","expenses and bills")+
+      ". Remove it and move "+(n===1?"that":"them")+" to \u201c"+other+"\u201d?"
+      :"Remove the category \u201c"+c.name+"\u201d?")) return;
+    removeWithUndo("\u201c"+c.name+"\u201d removed",()=>{
+      S.categories=S.categories.filter(x=>x.id!==id);
+      S.expenses.forEach(x=>{ if(x.cat===id) x.cat="other"; });
+      S.recurring.forEach(r=>{ if(r.cat===id) r.cat="other"; });
+      if(filter===id) filter=null;
+    });
     return;
   }
-  if(act==="save-settings"){
-    S.goal=num(val("g-goal")); S.deadline=val("g-date");
-    S.payDay=parseInt(val("g-payday"),10)||0;
-    S.holdings=readHoldLines("#set-holds");
-    const keep={}; S.holdings.forEach(h=>keep[h.id]=1);
-    S.investValues=S.investValues.filter(v=>keep[v.hid]);          // drop history for removed holdings
-    S.categories=Array.prototype.map.call(document.querySelectorAll("#set-cats .line"),el=>{
-      const old=S.categories.find(c=>c.id===el.dataset.id);
-      return {id:el.dataset.id, name:el.querySelector(".cat-name").value.trim(),
-        color:old?old.color:"#8c9aa3"};
-    }).filter(c=>c.name);
-    save(); render(); toast("Saved"); return;
+  if(act==="add-cat"){
+    const el=document.getElementById("cat-new"), name=el?el.value.trim():"";
+    if(!name){ toast("Type a name for it first"); if(el) el.focus(); return; }
+    if(S.categories.some(c=>c.name.toLowerCase()===name.toLowerCase())){ toast("You've already got \u201c"+name+"\u201d"); return; }
+    const used=S.categories.map(c=>c.color);
+    const color=CAT_COLORS.find(c=>used.indexOf(c)<0)||CAT_COLORS[S.categories.length%CAT_COLORS.length];
+    S.categories.push({id:uid(), name, color});
+    save(); renderKeeping(); toast("Added \u201c"+name+"\u201d"); return;
   }
+  if(act==="save-settings"){ applySettings(); save(); render(); toast("Saved"); return; }
   if(act==="backup"){
     const f=figuresFile();
     download(f.name,f.text);
@@ -1991,9 +2313,11 @@ document.getElementById("app").addEventListener("click",e=>{
     }).catch(()=>toast("Couldn't read the photos back"));
     return; }
   if(act==="restore"){ document.getElementById("restore-file").click(); return; }
+  if(act==="recover-v4"){ recoverV4(); return; }
   if(act==="ask-wipe"){ confirmWipe=true; render(); return; }
   if(act==="cancel-wipe"){ confirmWipe=false; render(); return; }
-  if(act==="wipe"){ localStorage.removeItem(KEY); localStorage.removeItem(OLD_KEY);
+  if(act==="wipe"){ settleUndo();
+    [KEY,KEY+":unreadable",KEY+":before-recover"].concat(OLD_KEYS).forEach(k=>localStorage.removeItem(k));
     if(S) S.expenses.forEach(e=>{ if(e.photo) photoDel(e.id).catch(()=>{}); });
     photoUrls={}; S=null; confirmWipe=false; tab="pay"; spendSub=null; render(); return; }
 });
